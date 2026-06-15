@@ -19,6 +19,9 @@ import json
 import os
 import urllib.request
 
+# USDC on Base mainnet — matches AgentsPrice (server.py USDC_BASE). Override via env.
+USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
 
 def build_requirements(quote, *, pay_to=None, network=None, asset=None,
                        resource="/v1/burst", description="verified inference burst"):
@@ -27,13 +30,13 @@ def build_requirements(quote, *, pay_to=None, network=None, asset=None,
         "x402Version": 1,
         "accepts": [{
             "scheme": "exact",
-            "network": network or os.environ.get("X402_NETWORK", "base-sepolia"),
+            "network": network or os.environ.get("X402_NETWORK", "base"),
             "maxAmountRequired": str(quote["price_usdc_base_units"]),
             "resource": resource,
             "description": description,
             "mimeType": "application/json",
             "payTo": pay_to or os.environ.get("X402_PAY_TO", "0xSELLER_WALLET_UNSET"),
-            "asset": asset or os.environ.get("X402_USDC_ASSET", "0xUSDC_UNSET"),
+            "asset": asset or os.environ.get("X402_USDC_ASSET", USDC_BASE),
             "maxTimeoutSeconds": 60,
             "extra": {"priceUsd": quote["price_usd"]},
         }],

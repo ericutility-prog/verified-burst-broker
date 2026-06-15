@@ -49,10 +49,10 @@ TIERS = {
         "base_url": "https://api.cerebras.ai/v1",
         "api_key_env": "CEREBRAS_API_KEY",
         "model": os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b"),
-        # VERIFY: https://www.cerebras.ai/pricing  (pay-as-you-go, open-weight models)
-        "price_in": 0.85,
-        "price_out": 1.20,
-        "price_verified": False,
+        # gpt-oss-120b on Cerebras, verified May 2026 (artificialanalysis / pricepertoken)
+        "price_in": 0.35,
+        "price_out": 0.75,
+        "price_verified": True,
     },
     "bulk": {
         "label": "Bulk / default (BYOK, OpenAI-compatible)",

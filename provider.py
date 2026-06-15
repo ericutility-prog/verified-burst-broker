@@ -16,10 +16,10 @@ CEREBRAS = {
     "base_url": "https://api.cerebras.ai/v1",
     "key_env": "CEREBRAS_API_KEY",
     "model": os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b"),
-    # $ / 1M tokens — VERIFY at https://www.cerebras.ai/pricing before quoting.
-    "price_in": 0.85,
-    "price_out": 1.20,
-    "price_verified": False,
+    # $ / 1M tokens — gpt-oss-120b on Cerebras, verified May 2026 (artificialanalysis/pricepertoken).
+    "price_in": 0.35,
+    "price_out": 0.75,
+    "price_verified": True,
 }
 
 
