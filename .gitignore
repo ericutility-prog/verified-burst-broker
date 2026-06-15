@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 .relayer_wallet.json
 .mainnet_selftest_buyer.json
+client/dist/
+client/build/
+client/*.egg-info/
+client/verified_burst.egg-info/

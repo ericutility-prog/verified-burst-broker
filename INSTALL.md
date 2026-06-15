@@ -11,13 +11,16 @@ answer passes**. No subscription, no human in the loop, budget-capped.
   ever put in its *private key*; never a seed phrase.)
 - **(Optional) your own Cerebras key** — bring it and bursts run on *your* tokens
   and rate limit (BYOK). Omit it and the host's key is used.
-- **Python 3.10+** and the buyer-side signing deps:
-  ```
-  pip install "x402[evm]" eth-account web3
-  ```
-- `mcp_remote.py` + `x402_live.py` from this repo on disk.
+- **Python 3.10+.**
 
-## 2. One-line MCP config
+## 2. Install
+
+```bash
+pip install verified-burst
+# or zero-install:  uvx verified-burst   (pipx run verified-burst)
+```
+
+## 3. One-line MCP config
 
 Add to your MCP client (Claude Desktop / Cursor / your agent framework):
 
@@ -25,8 +28,7 @@ Add to your MCP client (Claude Desktop / Cursor / your agent framework):
 {
   "mcpServers": {
     "verified-burst": {
-      "command": "python3",
-      "args": ["/path/to/mcp_remote.py"],
+      "command": "verified-burst",
       "env": {
         "BURST_BUYER_KEY": "0x<your Base wallet private key>",
         "BURST_PROVIDER_KEY": "csk-<your Cerebras key>"
@@ -38,6 +40,10 @@ Add to your MCP client (Claude Desktop / Cursor / your agent framework):
 
 `BURST_PROVIDER_KEY` is optional (BYOK). `BURST_ENDPOINT` defaults to
 `https://solcleus.com/v1/burst` — override it to point at your own host.
+
+> No-install alternative: run the single file `mcp_remote.py` (needs
+> `pip install "x402[evm]" eth-account web3` + `x402_live.py` alongside it) with
+> `"command": "python3", "args": ["/path/to/mcp_remote.py"]`.
 
 ## 3. Use it
 

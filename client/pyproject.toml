@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verified-burst"
+version = "1.0.0"
+description = "MCP client: your agent buys verified inference bursts and pays only if the answer is correct (x402, BYOK)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "x402", "agents", "inference", "cerebras", "verification", "base"]
+dependencies = [
+    "x402[evm]>=2.13",
+    "eth-account>=0.13",
+]
+
+[project.urls]
+Homepage = "https://solcleus.com/v1/info"
+
+[project.scripts]
+verified-burst = "verified_burst.__main__:main"
+
+[tool.setuptools]
+packages = ["verified_burst"]
