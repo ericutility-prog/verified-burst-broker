@@ -11,12 +11,44 @@ Stdlib only. Run: python3 server.py  (PORT env, default 8402).
 """
 import json
 import os
+import threading
+import time
+from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import env; env.load_env()
 import pricing
 import broker
+
+# --- hardening knobs -------------------------------------------------------- #
+BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")  # localhost only; nginx fronts TLS
+MAX_BODY = int(os.environ.get("BURST_MAX_BODY", str(32 * 1024)))   # 32 KB request cap
+MAX_REQ_CHARS = int(os.environ.get("BURST_MAX_REQ_CHARS", "8000")) # prompt length cap
+RATE_PER_MIN = int(os.environ.get("BURST_RATE_PER_MIN", "30"))     # /v1/burst per IP/min
+# Blowback: require the caller's OWN provider key (BYOK) so every burst costs the
+# CALLER their tokens — no free inference to extract from the host on non-verified
+# results. On for the public endpoint; off for in-process/demo (host key fallback).
+REQUIRE_BYOK = os.environ.get("BURST_REQUIRE_BYOK", "0").lower() in ("1", "true", "yes")
+
+_HITS = defaultdict(deque)
+_HITS_LOCK = threading.Lock()
+
+
+def _rate_ok(ip):
+    """Sliding 60s window per client IP for the expensive /v1/burst path."""
+    now = time.monotonic()
+    with _HITS_LOCK:
+        dq = _HITS[ip]
+        while dq and now - dq[0] > 60.0:
+            dq.popleft()
+        if len(dq) >= RATE_PER_MIN:
+            return False
+        dq.append(now)
+        if len(_HITS) > 10000:  # bound memory: drop emptied buckets
+            for k in [k for k, v in _HITS.items() if not v]:
+                _HITS.pop(k, None)
+        return True
 
 
 def _key(d, *names, default=None):
@@ -51,22 +83,46 @@ class Handler(BaseHTTPRequestHandler):
                 n=int(qs.get("n", ["3"])[0])))
         return self._send(404, {"error": "not_found"})
 
+    def _client_ip(self):
+        # Behind nginx (bound to localhost), X-Real-IP is set by us to the real
+        # peer and is not client-spoofable. Fall back to XFF[0], then socket.
+        return (self.headers.get("X-Real-IP")
+                or self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                or self.client_address[0])
+
     def do_POST(self):
         u = urlparse(self.path)
         if u.path != "/v1/burst":
             return self._send(404, {"error": "not_found"})
+        if not _rate_ok(self._client_ip()):
+            return self._send(429, {"error": "rate_limited", "retry_after_s": 60},
+                              {"Retry-After": "60"})
         try:
             n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return self._send(400, {"error": "bad_length"})
+        if n > MAX_BODY:
+            return self._send(413, {"error": "request_too_large", "max_bytes": MAX_BODY})
+        try:
             req = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return self._send(400, {"error": "bad_json"})
 
         if not req.get("request"):
             return self._send(400, {"error": "missing 'request'"})
+        if len(str(req["request"])) > MAX_REQ_CHARS:
+            return self._send(413, {"error": "request_too_long", "max_chars": MAX_REQ_CHARS})
+
+        # BYOK: buyer brings their own provider key via header (their tokens, their
+        # rate limit). Never logged (log_message is silenced).
+        provider_key = self.headers.get("X-Provider-Key") or self.headers.get("X-Cerebras-Key")
+        # Blowback: on the public endpoint, reject callers without their own key so
+        # they can never make us spend inference on a deliberately non-verifiable prompt.
+        if REQUIRE_BYOK and not provider_key:
+            return self._send(400, {"error": "byok_required",
+                                    "hint": "send X-Provider-Key with your own Cerebras key"})
 
         ak = req.get("answer_key")
-        # BYOK: buyer brings their own provider key via header (their tokens, their
-        # rate limit). Never logged (log_message is silenced); falls back to our key.
         result = broker.serve_burst(
             req["request"],
             x_payment=self.headers.get("X-PAYMENT"),
@@ -74,7 +130,7 @@ class Handler(BaseHTTPRequestHandler):
             n=int(req.get("n", 3)),
             verifier=req.get("verifier", "self_consistency"),
             answer_key=tuple(ak) if isinstance(ak, list) else None,
-            provider_key=self.headers.get("X-Provider-Key") or self.headers.get("X-Cerebras-Key"),
+            provider_key=provider_key,
             model=req.get("model"),
         )
 
@@ -90,9 +146,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get("PORT", "8402"))
-    fac_mode = "SIM" if not os.environ.get("X402_FACILITATOR_URL") else "REAL"
-    print(f"verified-burst broker on :{port}  (x402={fac_mode}, model={pricing.quote()['model']})")
-    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    mode = os.environ.get("X402_MODE", "sim")
+    print(f"verified-burst broker on {BIND_HOST}:{port}  "
+          f"(x402={mode}, rate={RATE_PER_MIN}/min/ip, model={pricing.quote()['model']})")
+    ThreadingHTTPServer((BIND_HOST, port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
