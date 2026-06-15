@@ -24,6 +24,14 @@ import os
 
 from eth_account import Account
 
+# Default public RPCs per network (used by the self-hosted local facilitator
+# when X402_RPC_URL is not set). Public endpoints are fine to start; swap for an
+# Alchemy/Infura URL via X402_RPC_URL for production reliability.
+_DEFAULT_RPC = {
+    "eip155:8453": "https://mainnet.base.org",   # Base mainnet
+    "eip155:84532": "https://sepolia.base.org",  # Base Sepolia testnet
+}
+
 from x402.http import (
     DEFAULT_FACILITATOR_URL,
     HTTPFacilitatorClientSync,
@@ -134,6 +142,19 @@ class LiveFacilitator:
     """
 
     def __init__(self, url: str = FACILITATOR_URL, timeout: float = 30.0):
+        # SELF-HOSTED mode: X402_FACILITATOR_MODE=local -> settle in-process via
+        # the SDK's ExactEvmFacilitatorScheme + a FacilitatorWeb3Signer (our own
+        # relayer wallet pays gas; buyer USDC moves straight to pay_to). No CDP,
+        # no public facilitator, no external service.
+        self._local = None
+        self.relayer = ""
+        if os.environ.get("X402_FACILITATOR_MODE", "").lower() == "local":
+            self._local, self.relayer = _make_local_scheme()
+            self.url = "local://in-process"
+            self.mainnet = DEFAULT_NETWORK == BASE_MAINNET
+            self._client = None
+            return
+
         # HTTPFacilitatorClientSync is the concrete sync client;
         # FacilitatorClientSync (in x402.http) is only a Protocol. Its dict-config
         # path consumes {"url", "create_headers"} (NOT "auth_provider").
@@ -153,6 +174,8 @@ class LiveFacilitator:
     # -- public ---------------------------------------------------------------
     def get_supported(self):
         """Raw SupportedResponse from the facilitator (kinds/extensions/signers)."""
+        if self._local is not None:
+            return {"mode": "local", "network": DEFAULT_NETWORK, "relayer": self.relayer}
         return self._client.get_supported()
 
     def verify(self, x_payment, requirements) -> dict:
@@ -164,7 +187,8 @@ class LiveFacilitator:
         except Exception as exc:  # garbage/undecodable X-PAYMENT from a caller
             return {"valid": False, "reason": f"bad_payment: {exc}", "payer": ""}
         try:
-            r = self._client.verify(payload, reqs)
+            engine = self._local if self._local is not None else self._client
+            r = engine.verify(payload, reqs)
         except Exception as exc:  # network / facilitator-level failure
             return {"valid": False, "reason": f"{type(exc).__name__}: {exc}", "payer": ""}
         return {
@@ -182,7 +206,8 @@ class LiveFacilitator:
         except Exception as exc:
             return {"success": False, "tx": "", "reason": f"bad_payment: {exc}"}
         try:
-            r = self._client.settle(payload, reqs)
+            engine = self._local if self._local is not None else self._client
+            r = engine.settle(payload, reqs)
         except Exception as exc:
             return {"success": False, "tx": "", "reason": f"{type(exc).__name__}: {exc}"}
         return {
@@ -190,6 +215,50 @@ class LiveFacilitator:
             "tx": r.transaction or "",
             "reason": r.error_reason or r.error_message or "",
         }
+
+
+# ---------------------------------------------------------------------------
+# self-hosted (local, in-process) facilitator
+# ---------------------------------------------------------------------------
+def _load_relayer_key() -> str:
+    """Resolve the relayer private key (hex). The relayer is a gas-only hot
+    wallet that submits settle txs; it never receives revenue.
+
+    Order: X402_RELAYER_KEY env -> JSON keyfile at X402_RELAYER_KEYFILE
+    (default .relayer_wallet.json), reading its "private_key" field.
+    """
+    key = os.environ.get("X402_RELAYER_KEY")
+    if key:
+        return key
+    path = os.environ.get("X402_RELAYER_KEYFILE", ".relayer_wallet.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data["private_key"]
+    except (OSError, KeyError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "local facilitator needs a relayer key: set X402_RELAYER_KEY or "
+            f"provide {path} with a 'private_key' field ({exc})"
+        ) from exc
+
+
+def _make_local_scheme():
+    """Build the in-process facilitator: (ExactEvmFacilitatorScheme, relayer_addr).
+
+    Uses the SDK's web3-backed FacilitatorWeb3Signer so verify/settle run against
+    the chain directly — the relayer wallet pays gas, the buyer's USDC settles to
+    pay_to. RPC: X402_RPC_URL, else the public default for DEFAULT_NETWORK.
+    """
+    from x402.mechanisms.evm import FacilitatorWeb3Signer
+    from x402.mechanisms.evm.exact import ExactEvmFacilitatorScheme
+
+    key = _load_relayer_key()
+    rpc = os.environ.get("X402_RPC_URL") or _DEFAULT_RPC.get(DEFAULT_NETWORK)
+    if not rpc:
+        raise RuntimeError(f"no RPC for network {DEFAULT_NETWORK}; set X402_RPC_URL")
+    signer = FacilitatorWeb3Signer(private_key=key, rpc_url=rpc)
+    scheme = ExactEvmFacilitatorScheme(signer)
+    return scheme, signer.get_addresses()[0]
 
 
 # ---------------------------------------------------------------------------

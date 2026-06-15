@@ -48,19 +48,45 @@ TOOL = {
 
 
 def _sim_payment():
-    """In sim mode the server presents the agent's identity as the payer. In real
-    mode this is where a signed x402 authorization from the agent's wallet goes."""
+    """In sim mode the server presents the agent's identity as the payer."""
     return base64.b64encode(json.dumps({"from": AGENT_ID}).encode()).decode()
+
+
+def _payment(strategy, n, verifier):
+    """Produce the X-PAYMENT for this burst.
+
+    LIVE (X402_MODE=live): sign a REAL x402 (EIP-3009) authorization for the
+    quoted price using the agent's own funding wallet (BURST_BUYER_KEY) paying to
+    the seller (X402_PAY_TO). The agent never has to "decide" to sign — the tool
+    auto-signs, and the broker charges ONLY if the answer verifies, capped by the
+    per-agent budget. SIM: present the agent identity.
+    """
+    if os.environ.get("X402_MODE", "sim").lower() != "live":
+        return _sim_payment()
+    import pricing, x402_live
+    buyer_key = os.environ.get("BURST_BUYER_KEY")
+    if not buyer_key:
+        raise RuntimeError("X402_MODE=live needs BURST_BUYER_KEY (the agent's funding wallet key)")
+    pay_to = os.environ.get("X402_PAY_TO")
+    if not pay_to:
+        raise RuntimeError("X402_MODE=live needs X402_PAY_TO (the seller wallet)")
+    q = pricing.quote(strategy=strategy, n=n, verifier=verifier)
+    reqs, _ = x402_live.build_requirements_v2(q["price_usd"], pay_to)
+    _, x_payment = x402_live.sign_payment(reqs, buyer_key)
+    return x_payment
 
 
 def call_tool(args):
     ak = args.get("answer_key")
+    strategy = args.get("strategy", "best_of_n")
+    n = int(args.get("n", 3))
+    verifier = args.get("verifier", "self_consistency")
     result = broker.serve_burst(
         args["request"],
-        x_payment=_sim_payment(),
-        strategy=args.get("strategy", "best_of_n"),
-        n=int(args.get("n", 3)),
-        verifier=args.get("verifier", "self_consistency"),
+        x_payment=_payment(strategy, n, verifier),
+        strategy=strategy,
+        n=n,
+        verifier=verifier,
         answer_key=tuple(ak) if isinstance(ak, list) else None,
         receipt_id=f"mcp-{AGENT_ID}",
     )

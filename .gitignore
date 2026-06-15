@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .testnet_wallets.json
 .venv/
+.relayer_wallet.json
+.mainnet_selftest_buyer.json
