@@ -5,6 +5,8 @@ whole product in ~40 lines: the buyer is charged only when the verifier passes, 
 never beyond their per-agent budget cap (the governor that lets builders trust
 autonomous spend).
 """
+import os
+
 import pricing
 import burst as burst_mod
 from x402_gate import Facilitator, build_requirements
@@ -12,6 +14,21 @@ from x402_gate import Facilitator, build_requirements
 # Per-payer spend ledger (in-memory; swap for the AgentsPrice margin governor in prod).
 _SPENT = {}
 DEFAULT_BUDGET_USD = 1.00  # per-agent cap; mirror AgentsPrice's governor
+
+
+def _gate(quote):
+    """Pick the payment gate. X402_MODE=live -> real on-chain settlement via the
+    SDK (venv-only, lazy-imported); otherwise the stdlib sim. Returns
+    (facilitator, requirements, accepts_json)."""
+    if os.environ.get("X402_MODE", "sim").lower() == "live":
+        import x402_live  # needs the venv (x402 + eth_account + web3)
+        pay_to = os.environ.get("X402_PAY_TO")
+        if not pay_to:
+            raise RuntimeError("X402_MODE=live but X402_PAY_TO (seller wallet) is unset")
+        reqs, _ = x402_live.build_requirements_v2(quote["price_usd"], pay_to)
+        return x402_live.LiveFacilitator(), reqs, [reqs.model_dump(by_alias=True, exclude_none=True)]
+    r = build_requirements(quote)
+    return Facilitator(), r, r["accepts"]
 
 
 def remaining_budget(payer, cap=DEFAULT_BUDGET_USD):
@@ -24,14 +41,17 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
                 receipt_id="burst"):
     """Returns a result dict. `status` is one of:
        payment_required | budget_exceeded | not_verified(charged:false) | ok(charged:true)."""
-    fac = facilitator or Facilitator()
     q = pricing.quote(strategy=strategy, n=n, verifier=verifier)
-    reqs = build_requirements(q)
+    if facilitator is not None:          # explicit override (tests) -> sim shape
+        fac, reqs = facilitator, build_requirements(q)
+        accepts = reqs["accepts"]
+    else:
+        fac, reqs, accepts = _gate(q)    # sim or live, by X402_MODE
 
     # 1) authorize the payment (do NOT capture yet)
     auth = fac.verify(x_payment, reqs)
     if not auth["valid"]:
-        return {"status": "payment_required", "quote": q, "accepts": reqs["accepts"],
+        return {"status": "payment_required", "quote": q, "accepts": accepts,
                 "reason": auth.get("reason")}
     payer = auth.get("payer", "unknown")
 
