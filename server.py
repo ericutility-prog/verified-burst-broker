@@ -51,6 +51,71 @@ def _rate_ok(ip):
         return True
 
 
+PUBLIC_URL = os.environ.get("BURST_PUBLIC_URL", "https://solcleus.com").rstrip("/")
+
+# The buyable tool's input shape — advertised so crawlers/agent frameworks can
+# call it without reading docs. Kept in sync with mcp_remote.py's TOOL.
+_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "request": {"type": "string", "description": "The decision/question to resolve."},
+        "strategy": {"type": "string", "enum": ["fast", "best_of_n"], "default": "best_of_n"},
+        "n": {"type": "integer", "default": 3},
+        "verifier": {"type": "string", "enum": ["self_consistency", "judge", "none"],
+                     "default": "self_consistency"},
+        "answer_key": {"type": "array", "items": {"type": "string"},
+                       "description": 'Optional ["json","<field>"] or ["regex","(<pat>)"].'},
+        "model": {"type": "string", "description": "Optional model (must match your BYOK key)."},
+    },
+    "required": ["request"],
+}
+
+
+def _accepts_for(price_usd):
+    """Exact x402 `accepts` for a price. Live mode builds the real requirements
+    (correct asset/payTo/domain); falls back to a descriptive shape otherwise."""
+    if os.environ.get("X402_MODE", "sim").lower() == "live":
+        try:
+            import x402_live
+            reqs, _ = x402_live.build_requirements_v2(price_usd, os.environ.get("X402_PAY_TO", ""))
+            return [reqs.model_dump(by_alias=True, exclude_none=True)]
+        except Exception:
+            pass
+    return [{"scheme": "exact", "network": os.environ.get("X402_NETWORK", "eip155:84532"),
+             "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+             "payTo": os.environ.get("X402_PAY_TO", ""),
+             "maxAmountRequired": str(int(round(price_usd * 1e6))), "maxTimeoutSeconds": 300}]
+
+
+def _manifest():
+    """Self-describing service manifest for agent/crawler discovery."""
+    q = pricing.quote()
+    return {
+        "x402Version": 1,
+        "name": "Verified Burst",
+        "description": ("Pay-per-correct-answer inference bursts for agents: escalate to fast "
+                        "silicon, sample best-of-N, verify, and settle over x402 — charged ONLY "
+                        "if the answer passes a verifier. BYOK; self-hosted settlement."),
+        "resources": [{
+            "method": "POST",
+            "path": "/v1/burst",
+            "url": f"{PUBLIC_URL}/v1/burst",
+            "description": "Buy a verified inference burst. Pay only if the verifier passes.",
+            "price": {"display": f"${q['price_usd']}",
+                      "amount": str(int(round(q['price_usd'] * 1e6))),
+                      "currency": "USDC", "decimals": 6},
+            "accepts": _accepts_for(q["price_usd"]),
+            "requires_byok": REQUIRE_BYOK,
+            "byok_header": "X-Provider-Key",
+            "input_schema": _INPUT_SCHEMA,
+        }],
+        "quote_url": f"{PUBLIC_URL}/v1/quote",
+        "facilitator": "self-hosted",
+        "networks": [os.environ.get("X402_NETWORK", "eip155:8453")],
+        "mcp": {"client": "mcp_remote.py", "tool": "buy_verified_burst", "install": "INSTALL.md"},
+    }
+
+
 def _key(d, *names, default=None):
     for n in names:
         if n in d:
@@ -76,6 +141,9 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/healthz":
             return self._send(200, {"ok": True})
+        if u.path in ("/.well-known/x402", "/v1/info"):
+            # machine-readable discovery manifest (cacheable)
+            return self._send(200, _manifest(), {"Cache-Control": "public, max-age=300"})
         if u.path == "/v1/quote":
             qs = parse_qs(u.query)
             return self._send(200, pricing.quote(
