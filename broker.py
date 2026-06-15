@@ -38,7 +38,7 @@ def remaining_budget(payer, cap=DEFAULT_BUDGET_USD):
 def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
                 verifier="self_consistency", answer_key=None, check=None,
                 budget_cap=DEFAULT_BUDGET_USD, facilitator=None, call_fn=None,
-                receipt_id="burst"):
+                receipt_id="burst", provider_key=None, model=None):
     """Returns a result dict. `status` is one of:
        payment_required | budget_exceeded | not_verified(charged:false) | ok(charged:true)."""
     q = pricing.quote(strategy=strategy, n=n, verifier=verifier)
@@ -64,7 +64,8 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     # 3) buy more thinking
     res = burst_mod.run_burst(request, strategy=strategy, n=n, verifier=verifier,
                               answer_key=answer_key, check=check,
-                              receipt_id=receipt_id, call_fn=call_fn)
+                              receipt_id=receipt_id, call_fn=call_fn,
+                              provider_key=provider_key, model=model)
 
     # 4) settle ONLY if the verifier passed — else discard the authorization (no charge)
     if not res.passed:

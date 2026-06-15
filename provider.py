@@ -29,13 +29,20 @@ CEREBRAS = {
 }
 
 
-def chat(messages, *, tier=CEREBRAS, temperature=0.0, max_tokens=256, timeout=60):
-    """One chat call. Returns dict(text, usage, latency_s). Raises on transport error."""
-    key = os.environ.get(tier["key_env"], "")
+def chat(messages, *, tier=CEREBRAS, temperature=0.0, max_tokens=256, timeout=60,
+         api_key=None, model=None):
+    """One chat call. Returns dict(text, usage, latency_s). Raises on transport error.
+
+    BYOK: `api_key` is the BUYER's own provider key — when supplied, the call bills
+    to THEIR key (their tokens, their rate limit) and we never store or log it. We
+    fall back to our env key only when the buyer doesn't bring one. `model` lets the
+    buyer pick the model their key is entitled to (default = our fast tier).
+    """
+    key = api_key or os.environ.get(tier["key_env"], "")
     if not key:
-        raise RuntimeError(f"{tier['key_env']} not set (BYOK)")
+        raise RuntimeError(f"no provider key: pass api_key (BYOK) or set {tier['key_env']}")
     body = json.dumps({
-        "model": tier["model"],
+        "model": model or tier["model"],
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,

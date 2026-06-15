@@ -89,6 +89,9 @@ def call_tool(args):
         verifier=verifier,
         answer_key=tuple(ak) if isinstance(ak, list) else None,
         receipt_id=f"mcp-{AGENT_ID}",
+        # BYOK: agent's own provider key (their tokens/rate limit), never logged.
+        provider_key=os.environ.get("BURST_PROVIDER_KEY"),
+        model=args.get("model"),
     )
     return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}],
             "isError": result["status"] not in ("ok", "not_verified")}

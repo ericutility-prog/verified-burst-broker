@@ -65,6 +65,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "missing 'request'"})
 
         ak = req.get("answer_key")
+        # BYOK: buyer brings their own provider key via header (their tokens, their
+        # rate limit). Never logged (log_message is silenced); falls back to our key.
         result = broker.serve_burst(
             req["request"],
             x_payment=self.headers.get("X-PAYMENT"),
@@ -72,6 +74,8 @@ class Handler(BaseHTTPRequestHandler):
             n=int(req.get("n", 3)),
             verifier=req.get("verifier", "self_consistency"),
             answer_key=tuple(ak) if isinstance(ak, list) else None,
+            provider_key=self.headers.get("X-Provider-Key") or self.headers.get("X-Cerebras-Key"),
+            model=req.get("model"),
         )
 
         if result["status"] == "payment_required":

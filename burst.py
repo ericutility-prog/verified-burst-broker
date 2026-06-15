@@ -91,8 +91,13 @@ def verify_judge(candidate_text, request, call_fn):
 
 # --------------------------- the burst -------------------------------------- #
 def run_burst(request, *, strategy="best_of_n", n=3, verifier="self_consistency",
-              answer_key=None, check=None, receipt_id="sim", call_fn=None):
-    call_fn = call_fn or provider.chat
+              answer_key=None, check=None, receipt_id="sim", call_fn=None,
+              provider_key=None, model=None):
+    if call_fn is None:
+        # Real provider path: thread the buyer's BYOK key/model into every sample.
+        def call_fn(msgs, temperature=0.0):
+            return provider.chat(msgs, temperature=temperature,
+                                 api_key=provider_key, model=model)
     n = 1 if strategy == "fast" else max(2, n)
     msgs = [{"role": "user", "content": request}]
 
