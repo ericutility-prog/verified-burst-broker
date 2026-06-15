@@ -13,6 +13,7 @@ product code.
 """
 import json
 import re
+import concurrent.futures
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 
@@ -95,15 +96,31 @@ def run_burst(request, *, strategy="best_of_n", n=3, verifier="self_consistency"
     n = 1 if strategy == "fast" else max(2, n)
     msgs = [{"role": "user", "content": request}]
 
-    candidates, usage_total, latency = [], Counter(), 0.0
-    for i in range(n):
-        # vary temperature across samples so best-of-N actually explores
-        r = call_fn(msgs, temperature=0.0 if i == 0 else 0.7)
-        candidates.append(r)
+    # vary temperature across samples so best-of-N actually explores
+    temps = [0.0 if i == 0 else 0.7 for i in range(n)]
+
+    # Run the N samples CONCURRENTLY (I/O-bound HTTP). Burst latency = the slowest
+    # single call, not the sum — this is what makes a best-of-N burst "hum". Tolerant
+    # of partial failures: a 429/timeout on one sample doesn't sink the whole burst.
+    indexed = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as ex:
+        futs = {ex.submit(call_fn, msgs, temperature=temps[i]): i for i in range(n)}
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                indexed.append((futs[fut], fut.result()))
+            except Exception:
+                pass  # drop a failed sample; verifier works on whoever returned
+    if not indexed:
+        raise RuntimeError("all burst samples failed")
+    indexed.sort(key=lambda t: t[0])           # keep i==0 (the temp-0 anchor) first
+    candidates = [r for _, r in indexed]
+
+    usage_total, latency = Counter(), 0.0
+    for r in candidates:
         for k, v in (r.get("usage") or {}).items():
             if isinstance(v, int):
                 usage_total[k] += v
-        latency = max(latency, r.get("latency_s", 0.0))  # bursts run concurrently in prod
+        latency = max(latency, r.get("latency_s", 0.0))  # concurrent -> wall ≈ max
 
     if verifier == "deterministic_check" and check is not None:
         answer, verdict = verify_check(candidates[0]["text"], check)

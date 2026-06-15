@@ -6,11 +6,17 @@ tokens themselves (BYOK = no resale TOS risk).
 """
 import json
 import os
+import random
 import time
+import urllib.error
 import urllib.request
 
 import env
 env.load_env()
+
+# Transient statuses worth retrying: rate-limit + gateway/overload.
+_RETRY_STATUS = {429, 500, 502, 503, 529}
+_MAX_RETRIES = int(os.environ.get("CEREBRAS_MAX_RETRIES", "4"))
 
 CEREBRAS = {
     "base_url": "https://api.cerebras.ai/v1",
@@ -40,10 +46,33 @@ def chat(messages, *, tier=CEREBRAS, temperature=0.0, max_tokens=256, timeout=60
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
                  "User-Agent": "Mozilla/5.0 (burst-broker)"},  # urllib UA trips Cloudflare 1010
     )
-    t0 = time.monotonic()
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read())
-    dt = time.monotonic() - t0
+    # Retry transient rate-limit/overload with exponential backoff + jitter so a
+    # single 429 never sinks a burst. Honors Retry-After when the server sends it.
+    last_exc = None
+    for attempt in range(_MAX_RETRIES + 1):
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read())
+            dt = time.monotonic() - t0
+            break
+        except urllib.error.HTTPError as e:
+            last_exc = e
+            if e.code in _RETRY_STATUS and attempt < _MAX_RETRIES:
+                ra = e.headers.get("Retry-After") if e.headers else None
+                wait = float(ra) if (ra and str(ra).replace(".", "", 1).isdigit()) \
+                    else min(8.0, 0.4 * (2 ** attempt))
+                time.sleep(wait + random.random() * 0.25)
+                continue
+            raise
+        except urllib.error.URLError as e:  # transient network/timeout
+            last_exc = e
+            if attempt < _MAX_RETRIES:
+                time.sleep(min(8.0, 0.4 * (2 ** attempt)) + random.random() * 0.25)
+                continue
+            raise
+    else:  # pragma: no cover - loop always breaks or raises
+        raise last_exc
     msg = data["choices"][0]["message"]
     # reasoning models (gpt-oss) may put text in reasoning_content / leave content null
     text = msg.get("content") or msg.get("reasoning_content") or ""
