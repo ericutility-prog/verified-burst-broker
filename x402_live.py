@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 
 from eth_account import Account
 
@@ -30,8 +31,18 @@ from x402.http import (
 from x402.schemas import PaymentPayload, PaymentRequirements
 from x402.mechanisms.evm.exact import ExactEvmClientScheme, ExactEvmServerScheme
 
-# CAIP-2 id for Base Sepolia testnet (chain id 84532).
-BASE_SEPOLIA = "eip155:84532"
+# CAIP-2 network ids.
+BASE_SEPOLIA = "eip155:84532"   # testnet (public facilitator supports this)
+BASE_MAINNET = "eip155:8453"    # mainnet (needs a CDP/authed facilitator)
+
+# Network + facilitator are env-configurable so testnet->mainnet is a config flip:
+#   X402_NETWORK          (default eip155:84532)
+#   X402_FACILITATOR_URL  (default https://x402.org/facilitator — TESTNET ONLY)
+# For Base mainnet set X402_NETWORK=eip155:8453 and X402_FACILITATOR_URL to a CDP
+# facilitator, and provide auth via X402_CDP_KEY_ID / X402_CDP_KEY_SECRET (see
+# _auth_provider below).
+DEFAULT_NETWORK = os.environ.get("X402_NETWORK", BASE_SEPOLIA)
+FACILITATOR_URL = os.environ.get("X402_FACILITATOR_URL", DEFAULT_FACILITATOR_URL)
 
 # Reused server scheme: only used to RESOLVE the asset + EIP-712 domain from the
 # SDK's network config (parse_price / enhance_payment_requirements). It needs no
@@ -43,7 +54,7 @@ def build_requirements_v2(
     price_usd,
     pay_to,
     *,
-    network: str = BASE_SEPOLIA,
+    network: str = DEFAULT_NETWORK,
     resource: str = "/v1/burst",
     description: str = "verified inference burst",
 ):
@@ -121,11 +132,15 @@ class LiveFacilitator:
     SDK PaymentRequirements, the [requirements] list, or a dict.
     """
 
-    def __init__(self, url: str = DEFAULT_FACILITATOR_URL, timeout: float = 30.0):
+    def __init__(self, url: str = FACILITATOR_URL, timeout: float = 30.0):
         self.url = url
         # HTTPFacilitatorClientSync is the concrete sync client;
         # FacilitatorClientSync (in x402.http) is only a Protocol.
-        self._client = HTTPFacilitatorClientSync({"url": url})
+        cfg = {"url": url}
+        auth = _auth_provider()      # None on testnet; CDP auth on mainnet
+        if auth is not None:
+            cfg["auth_provider"] = auth
+        self._client = HTTPFacilitatorClientSync(cfg)
 
     # -- public ---------------------------------------------------------------
     def get_supported(self):
@@ -166,6 +181,22 @@ class LiveFacilitator:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+def _auth_provider():
+    """Facilitator auth. Returns None for the public TESTNET facilitator (no auth).
+
+    For a Base-mainnet CDP facilitator, set X402_CDP_KEY_ID / X402_CDP_KEY_SECRET.
+    The final step — attaching a CDP JWT (ES256, per Coinbase CDP auth) to each
+    verify/settle request via CreateHeadersAuthProvider — is completed once the CDP
+    key is in hand and can be tested against the live endpoint. Until then this
+    raises loudly rather than silently shipping mainnet unauthenticated.
+    """
+    if not (os.environ.get("X402_CDP_KEY_ID") and os.environ.get("X402_CDP_KEY_SECRET")):
+        return None
+    raise NotImplementedError(
+        "Mainnet CDP facilitator auth not wired yet. With the CDP API key in hand, "
+        "build a CreateHeadersAuthProvider that attaches a CDP JWT to verify/settle.")
+
+
 def _normalize_price(price_usd):
     """Accept '$0.004', 0.004, or '0.004' -> a Money value parse_price accepts."""
     if isinstance(price_usd, (int, float)):
