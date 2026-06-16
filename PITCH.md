@@ -53,27 +53,51 @@ verified bursts. `BURST_PROVIDER_KEY` is optional (BYOK). Full guide: INSTALL.md
 
 ---
 
-## Short post (Show HN / r/LocalLLaMA / MCP & agent communities)
+## Short post (finalized — Show HN primary; adapt for forums/Discord)
 
-**Show: Verified Burst — an MCP tool that lets your agent buy verified inference, pay only if correct**
+**Live links (use these, all true today):**
+- Landing/endpoint: https://burst.solcleus.com
+- Install: https://pypi.org/project/verified-burst/  (`pip install verified-burst`)
+- x402scan listing: https://www.x402scan.com/server/d09b513d-cefa-46de-a1c8-34189026c408
+- Settlement proof (BaseScan): https://basescan.org/tx/0x76921c33f6c83e78757b8218c101ac362ab19ba994ded6743b9bbb2defd359c4
 
-Agents run cheap models by default, then quietly get the high-stakes call wrong.
-I built a single MCP tool for exactly those moments: `buy_verified_burst`. At a
-hard decision the agent escalates to fast silicon (Cerebras), samples best-of-N,
-verifies the answer, and pays a few tenths of a cent over x402 — **only if it
-passes a verifier.** Wrong/unverifiable answers cost nothing.
+### Show HN
 
-Design choices:
-- **Pay-only-if-verified** — the verifier gates settlement, so purchase risk is ~0.
-- **x402 micropayments** — per-call stablecoin on Base, no subscription/human.
-- **BYOK** — you bring your own Cerebras key; I never resell tokens, just routing +
-  verification + settlement. Throughput scales with you, not my key.
-- **Self-hosted settlement** — no Coinbase/3rd-party facilitator in the loop.
-- **Budget-capped** per wallet, so autonomous spend is safe to enable.
+**Title:** `Show HN: Verified Burst – agents buy inference over x402, pay only if it's correct`
+**URL:** `https://burst.solcleus.com`
 
-It's live on Base mainnet, one line to install, open about exactly how the money
-moves. Endpoint + install: <link>. Honest status: it works end-to-end; I'm looking
-for the first builders to put real agent workloads through it. Feedback welcome.
+**Text:**
+Agents run a cheap model by default, then quietly get the high-stakes call wrong.
+I built one MCP tool for those moments: `buy_verified_burst`. At a hard decision the
+agent escalates to fast silicon (Cerebras), samples best-of-N, runs the answers
+through a verifier, and pays a few tenths of a cent over x402 — but **only if the
+answer passes the verifier.** A wrong or unverifiable answer costs nothing.
+
+- Pay-only-if-verified: the verifier gates settlement, so purchase risk is ~0.
+- x402 micropayments: per-call USDC on Base, no subscription, no human in the loop.
+- BYOK: bring your own Cerebras key, so your tokens bill to you. I sell routing +
+  verification + settlement, not marked-up tokens.
+- Self-hosted settlement: no third-party facilitator holding funds.
+- Budget-capped per wallet, so you can safely let the agent spend on its own.
+
+One line to install: `pip install verified-burst`, then drop it into any MCP client
+with a Base wallet key. Live on Base mainnet, listed on x402scan, open about exactly
+how the money moves. Honest status: it works end-to-end, but I have no outside users
+yet — I'm looking for the first builders to run real agent workloads through it.
+Feedback (especially "this is the wrong abstraction") very welcome.
+
+### Forum / Discord / r/AI_Agents version
+
+**Title:** `MCP tool: your agent buys a "verified inference burst" and pays only if the answer passes a verifier (BYOK, x402 on Base)`
+
+Same body as above, optionally opening with: "Built this for the moment an agent
+hits an irreversible decision and a cheap single-shot isn't safe enough."
+
+**Where to post:** Show HN (news.ycombinator.com/submit) is the primary shot.
+Then r/AI_Agents, the MCP community, and x402/Coinbase developer Discords. Skip
+r/LocalLLaMA unless leading hard with BYOK — a hosted paid layer can get pushback
+there. Post one at a time; reply fast to the first comments — that's what decides
+whether a Show HN catches.
 
 ---
 
