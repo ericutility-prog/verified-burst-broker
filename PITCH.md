@@ -66,32 +66,35 @@ verified bursts. `BURST_PROVIDER_KEY` is optional (BYOK). Full guide: INSTALL.md
 **Title:** `Show HN: Verified Burst – agents buy inference over x402, pay only if it's correct`
 **URL:** `https://burst.solcleus.com`
 
-**Text:**
-Agents run a cheap model by default, then quietly get the high-stakes call wrong.
-I built one MCP tool for those moments: `buy_verified_burst`. At a hard decision the
+**Text:** (lead with the no-key trial — lowest barrier to try)
+You can try it with just a Base wallet and a few cents — **no API key of your own.**
+Your first 3 bursts run on the host key; after that you bring your own (BYOK).
+
+The idea: agents run a cheap model by default, then quietly get the high-stakes call
+wrong. `buy_verified_burst` is one MCP tool for those moments. At a hard decision the
 agent escalates to fast silicon (Cerebras), samples best-of-N, runs the answers
 through a verifier, and pays a few tenths of a cent over x402 — but **only if the
 answer passes the verifier.** A wrong or unverifiable answer costs nothing.
 
+- No key to start: first 3 bursts run on the host key, then BYOK (your own Cerebras key — your tokens, your rate limit).
 - Pay-only-if-verified: the verifier gates settlement, so purchase risk is ~0.
 - x402 micropayments: per-call USDC on Base, no subscription, no human in the loop.
-- BYOK: bring your own Cerebras key, so your tokens bill to you. I sell routing +
-  verification + settlement, not marked-up tokens.
 - Self-hosted settlement: no third-party facilitator holding funds.
-- Budget-capped per wallet, so you can safely let the agent spend on its own.
+- Budget-capped per wallet, so autonomous spend is safe to enable.
 
 One line to install: `pip install verified-burst`, then drop it into any MCP client
-with a Base wallet key. Live on Base mainnet, listed on x402scan, open about exactly
-how the money moves. Honest status: it works end-to-end, but I have no outside users
-yet — I'm looking for the first builders to run real agent workloads through it.
-Feedback (especially "this is the wrong abstraction") very welcome.
+with a Base wallet key. Live on Base mainnet, listed on x402scan, no outside users
+yet — looking for first builders. Feedback (especially "this is the wrong
+abstraction") very welcome.
 
 ### Forum / Discord / r/AI_Agents version
 
-**Title:** `MCP tool: your agent buys a "verified inference burst" and pays only if the answer passes a verifier (BYOK, x402 on Base)`
+**Title:** `MCP tool: your agent buys a "verified inference burst" and pays only if the answer passes a verifier (no API key needed to start)`
 
-Same body as above, optionally opening with: "Built this for the moment an agent
-hits an irreversible decision and a cheap single-shot isn't safe enough."
+Same body as above — keep the no-key-trial line first; it's the biggest friction
+drop for a first user (just a Base wallet, no Cerebras key for the first 3 bursts).
+NOTE: trial count is the `BURST_TRIAL_BURSTS` env value (3 today) — keep the copy in
+sync if you change it.
 
 **Where to post:** Show HN (news.ycombinator.com/submit) is the primary shot.
 Then r/AI_Agents, the MCP community, and x402/Coinbase developer Discords. Skip
