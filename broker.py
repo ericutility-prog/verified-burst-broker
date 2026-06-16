@@ -13,7 +13,16 @@ from x402_gate import Facilitator, build_requirements
 
 # Per-payer spend ledger (in-memory; swap for the AgentsPrice margin governor in prod).
 _SPENT = {}
+# Per-payer count of free-trial bursts run on the HOST provider key (no BYOK).
+# In-memory: resets on restart. The trial still requires a valid x402 payment, so
+# each free burst proves a funded wallet and (when verified) is paid for — the cap
+# just bounds host-token use per wallet before BYOK is required.
+_TRIAL = {}
 DEFAULT_BUDGET_USD = 1.00  # per-agent cap; mirror AgentsPrice's governor
+
+
+def trial_used(payer):
+    return _TRIAL.get(payer, 0)
 
 
 def _gate(quote):
@@ -38,7 +47,8 @@ def remaining_budget(payer, cap=DEFAULT_BUDGET_USD):
 def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
                 verifier="self_consistency", answer_key=None, check=None,
                 budget_cap=DEFAULT_BUDGET_USD, facilitator=None, call_fn=None,
-                receipt_id="burst", provider_key=None, model=None):
+                receipt_id="burst", provider_key=None, model=None,
+                require_byok=False, trial_cap=0):
     """Returns a result dict. `status` is one of:
        payment_required | budget_exceeded | not_verified(charged:false) | ok(charged:true)."""
     q = pricing.quote(strategy=strategy, n=n, verifier=verifier)
@@ -55,23 +65,43 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
                 "reason": auth.get("reason")}
     payer = auth.get("payer", "unknown")
 
-    # 2) governor: refuse if this burst would blow the per-agent cap
+    # 2) BYOK / free-trial gate. With no BYOK key, a wallet may run on the HOST key
+    #    for its first `trial_cap` bursts, then must bring its own key. The payment
+    #    was already validated above, so trial bursts still prove a funded wallet.
+    is_trial = False
+    if not provider_key and require_byok:
+        used = _TRIAL.get(payer, 0)
+        if trial_cap and used < trial_cap:
+            is_trial = True   # runs on the host env key; the slot is consumed after the burst
+        else:
+            return {"status": "byok_required", "payer": payer,
+                    "trial_used": used, "trial_cap": trial_cap,
+                    "hint": ("free trial used up — send X-Provider-Key with your own Cerebras key"
+                             if trial_cap else
+                             "send X-Provider-Key with your own Cerebras key")}
+
+    # 3) governor: refuse if this burst would blow the per-agent cap
     if q["price_usd"] > remaining_budget(payer, budget_cap):
         return {"status": "budget_exceeded", "payer": payer,
                 "remaining_usd": round(remaining_budget(payer, budget_cap), 6),
                 "price_usd": q["price_usd"]}
 
-    # 3) buy more thinking
+    # 4) buy more thinking
     res = burst_mod.run_burst(request, strategy=strategy, n=n, verifier=verifier,
                               answer_key=answer_key, check=check,
                               receipt_id=receipt_id, call_fn=call_fn,
                               provider_key=provider_key, model=model)
+    if is_trial:                       # consume one free-trial slot per completed host-key burst
+        _TRIAL[payer] = _TRIAL.get(payer, 0) + 1
 
-    # 4) settle ONLY if the verifier passed — else discard the authorization (no charge)
+    trial_remaining = max(0, trial_cap - _TRIAL.get(payer, 0)) if trial_cap else 0
+
+    # 5) settle ONLY if the verifier passed — else discard the authorization (no charge)
     if not res.passed:
         return {"status": "not_verified", "charged": False, "price_usd": 0.0,
                 "verdict": res.verdict, "answer": res.answer, "payer": payer,
-                "latency_s": res.latency_s, "cost_basis": res.cost_basis}
+                "latency_s": res.latency_s, "cost_basis": res.cost_basis,
+                "trial": is_trial, "trial_remaining": trial_remaining}
 
     s = fac.settle(x_payment, reqs)
     if s["success"]:
@@ -80,4 +110,5 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
             "tx": s.get("tx"), "mode": s.get("mode"), "verdict": res.verdict,
             "answer": res.answer, "payer": payer, "latency_s": res.latency_s,
             "cost_basis": res.cost_basis, "receipt_id": res.receipt_id,
-            "remaining_budget_usd": round(remaining_budget(payer, budget_cap), 6)}
+            "remaining_budget_usd": round(remaining_budget(payer, budget_cap), 6),
+            "trial": is_trial, "trial_remaining": trial_remaining}

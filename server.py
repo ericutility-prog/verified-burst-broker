@@ -30,6 +30,9 @@ RATE_PER_MIN = int(os.environ.get("BURST_RATE_PER_MIN", "30"))     # /v1/burst p
 # CALLER their tokens — no free inference to extract from the host on non-verified
 # results. On for the public endpoint; off for in-process/demo (host key fallback).
 REQUIRE_BYOK = os.environ.get("BURST_REQUIRE_BYOK", "0").lower() in ("1", "true", "yes")
+# Free-trial: a wallet with no BYOK key gets this many bursts on the HOST key (still
+# paid per burst), then must bring its own key. 0 = strict BYOK (no trial).
+TRIAL_CAP = int(os.environ.get("BURST_TRIAL_BURSTS", "0"))
 
 _HITS = defaultdict(deque)
 _HITS_LOCK = threading.Lock()
@@ -179,6 +182,7 @@ def _manifest(base=PUBLIC_URL):
                       "currency": "USDC", "decimals": 6},
             "accepts": _accepts_for(q["price_usd"]),
             "requires_byok": REQUIRE_BYOK,
+            "free_trial_bursts": TRIAL_CAP,  # first N per wallet run on the host key (still paid)
             "byok_header": "X-Provider-Key",
             "input_schema": _INPUT_SCHEMA,
         }],
@@ -270,13 +274,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(413, {"error": "request_too_long", "max_chars": MAX_REQ_CHARS})
 
         # BYOK: buyer brings their own provider key via header (their tokens, their
-        # rate limit). Never logged (log_message is silenced).
+        # rate limit). Never logged (log_message is silenced). The BYOK/free-trial
+        # gate runs inside serve_burst AFTER the payment is validated — so a no-key
+        # buyer can still pay and (within the per-wallet free-trial cap) run on the
+        # host key, then is asked to bring their own. Non-paying callers never run a
+        # burst, so there's still no free inference to extract.
         provider_key = self.headers.get("X-Provider-Key") or self.headers.get("X-Cerebras-Key")
-        # Blowback: on the public endpoint, reject callers without their own key so
-        # they can never make us spend inference on a deliberately non-verifiable prompt.
-        if REQUIRE_BYOK and not provider_key:
-            return self._send(400, {"error": "byok_required",
-                                    "hint": "send X-Provider-Key with your own Cerebras key"})
 
         ak = req.get("answer_key")
         result = broker.serve_burst(
@@ -288,11 +291,17 @@ class Handler(BaseHTTPRequestHandler):
             answer_key=tuple(ak) if isinstance(ak, list) else None,
             provider_key=provider_key,
             model=req.get("model"),
+            require_byok=REQUIRE_BYOK,
+            trial_cap=TRIAL_CAP,
         )
 
         if result["status"] == "payment_required":
             return self._send(402, {"x402Version": 1, "accepts": result["accepts"],
                                     "quote": result["quote"], "error": "payment_required"})
+        if result["status"] == "byok_required":
+            return self._send(400, {"error": "byok_required", "hint": result.get("hint"),
+                                    "trial_used": result.get("trial_used"),
+                                    "trial_cap": result.get("trial_cap")})
         if result["status"] == "budget_exceeded":
             return self._send(402, result)
         # not_verified -> 200 with charged:false (honest: no charge); ok -> 200 charged:true
