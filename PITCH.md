@@ -37,15 +37,19 @@ capped per wallet so you can safely let the agent buy on its own.
 
 ## Install (the one-liner)
 
+```bash
+pip install verified-burst      # or zero-install: uvx verified-burst
+```
+
 ```json
 { "mcpServers": { "verified-burst": {
-    "command": "python3", "args": ["/path/to/mcp_remote.py"],
+    "command": "verified-burst",
     "env": { "BURST_BUYER_KEY": "0x<base wallet key>",
              "BURST_PROVIDER_KEY": "csk-<your cerebras key>" } } } }
 ```
 
 Fund the wallet with a little USDC on Base. That's it — your agent can now buy
-verified bursts. Full guide: INSTALL.md.
+verified bursts. `BURST_PROVIDER_KEY` is optional (BYOK). Full guide: INSTALL.md.
 
 ---
 

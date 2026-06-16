@@ -52,6 +52,18 @@ def _rate_ok(ip):
 
 
 PUBLIC_URL = os.environ.get("BURST_PUBLIC_URL", "https://solcleus.com").rstrip("/")
+# Hosts we serve under: discovery URLs reflect the host the caller used (so the
+# burst.solcleus.com listing is self-consistent), but ONLY for known hosts — an
+# unknown/spoofed Host falls back to PUBLIC_URL, never echoing an attacker URL.
+_ALLOWED_HOSTS = {h.strip().lower() for h in
+                  os.environ.get("BURST_ALLOWED_HOSTS", "solcleus.com,burst.solcleus.com").split(",")
+                  if h.strip()}
+
+
+def _base_url_for(host_header):
+    """https://<host> when Host is one we serve; else PUBLIC_URL (anti-spoof)."""
+    host = (host_header or "").split(":", 1)[0].strip().lower()
+    return f"https://{host}" if host in _ALLOWED_HOSTS else PUBLIC_URL
 
 # The buyable tool's input shape — advertised so crawlers/agent frameworks can
 # call it without reading docs. Kept in sync with mcp_remote.py's TOOL.
@@ -70,28 +82,89 @@ _INPUT_SCHEMA = {
     "required": ["request"],
 }
 
+_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "description": "ok | not_verified | payment_required | budget_exceeded"},
+        "answer": {"type": "string", "description": "The verified answer (present when status=ok)."},
+        "verified": {"type": "boolean", "description": "Whether the verifier passed (gates the charge)."},
+        "charged": {"type": "boolean", "description": "True only if verified; you pay nothing otherwise."},
+        "amount_usd": {"type": "number", "description": "Service fee charged on a verified burst."},
+        "settle_tx": {"type": "string", "description": "On-chain settlement tx hash when charged."},
+        "remaining_budget_usd": {"type": "number", "description": "Wallet budget left after this call."},
+    },
+}
 
+
+# Discovery 402 representation is canonical x402 **v2** (x402Version 2). Crawlers/
+# registries (x402scan via @x402/core + @agentcash/discovery) reject v1 and require
+# a v2 body: a top-level `resource` object, amount-based `accepts`, and the
+# input/output JSON Schemas exposed under the `extensions.bazaar` discovery
+# extension. The ACTUAL payment 402 (POST /v1/burst) builds its own SDK
+# requirements via the broker and is unaffected — buyers sign against that.
 def _accepts_for(price_usd):
-    """Exact x402 `accepts` for a price. Live mode builds the real requirements
-    (correct asset/payTo/domain); falls back to a descriptive shape otherwise."""
-    if os.environ.get("X402_MODE", "sim").lower() == "live":
-        try:
-            import x402_live
-            reqs, _ = x402_live.build_requirements_v2(price_usd, os.environ.get("X402_PAY_TO", ""))
-            return [reqs.model_dump(by_alias=True, exclude_none=True)]
-        except Exception:
-            pass
-    return [{"scheme": "exact", "network": os.environ.get("X402_NETWORK", "eip155:84532"),
-             "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-             "payTo": os.environ.get("X402_PAY_TO", ""),
-             "maxAmountRequired": str(int(round(price_usd * 1e6))), "maxTimeoutSeconds": 300}]
+    """Canonical x402 v2 `accepts` (amount-based, CAIP-2 network)."""
+    return [{
+        "scheme": "exact",
+        "network": os.environ.get("X402_NETWORK", "eip155:8453"),
+        "amount": str(int(round(price_usd * 1e6))),  # USDC has 6 decimals
+        "asset": os.environ.get("X402_ASSET", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+        "payTo": os.environ.get("X402_PAY_TO", ""),
+        "maxTimeoutSeconds": 300,
+        "extra": {"name": "USD Coin", "version": "2"},
+    }]
 
 
-def _manifest():
+def _resource_info(base=PUBLIC_URL):
+    """x402 v2 top-level `resource` object."""
+    return {
+        "url": f"{base}/v1/burst",
+        "description": "Buy a verified inference burst. Pay only if the verifier passes.",
+        "mimeType": "application/json",
+        "serviceName": "Verified Burst",
+    }
+
+
+def _bazaar_ext():
+    """x402 v2 `extensions.bazaar` discovery extension. `info` carries example-
+    shaped input/output; `schema` carries the JSON Schemas where crawlers look
+    (schema.properties.input.properties.body / output.properties.example)."""
+    return {
+        "bazaar": {
+            "info": {"input": {"body": _INPUT_SCHEMA}, "output": _OUTPUT_SCHEMA},
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "input":  {"properties": {"body": _INPUT_SCHEMA}},
+                    "output": {"properties": {"example": _OUTPUT_SCHEMA}},
+                },
+            },
+        }
+    }
+
+
+def _discovery_402(q, base=PUBLIC_URL):
+    """Full canonical x402 v2 Payment-Required body for the GET discovery surface."""
+    return {
+        "x402Version": 2,
+        "error": "payment_required",
+        "resource": _resource_info(base),
+        "accepts": _accepts_for(q["price_usd"]),
+        "extensions": _bazaar_ext(),
+        # Human/agent-friendly extras (ignored/stripped by x402 validators):
+        "quote": q,
+        "hint": ("POST to this URL with an X-PAYMENT header to buy a verified burst — "
+                 "you are charged ONLY if the answer passes the verifier. "
+                 "GET /v1/info for the full manifest."),
+        "human_url": f"{base}/burst",
+    }
+
+
+def _manifest(base=PUBLIC_URL):
     """Self-describing service manifest for agent/crawler discovery."""
     q = pricing.quote()
     return {
-        "x402Version": 1,
+        "x402Version": 2,
         "name": "Verified Burst",
         "description": ("Pay-per-correct-answer inference bursts for agents: escalate to fast "
                         "silicon, sample best-of-N, verify, and settle over x402 — charged ONLY "
@@ -99,7 +172,7 @@ def _manifest():
         "resources": [{
             "method": "POST",
             "path": "/v1/burst",
-            "url": f"{PUBLIC_URL}/v1/burst",
+            "url": f"{base}/v1/burst",
             "description": "Buy a verified inference burst. Pay only if the verifier passes.",
             "price": {"display": f"${q['price_usd']}",
                       "amount": str(int(round(q['price_usd'] * 1e6))),
@@ -109,10 +182,12 @@ def _manifest():
             "byok_header": "X-Provider-Key",
             "input_schema": _INPUT_SCHEMA,
         }],
-        "quote_url": f"{PUBLIC_URL}/v1/quote",
+        "quote_url": f"{base}/v1/quote",
+        "human_url": f"{base}/burst",
         "facilitator": "self-hosted",
         "networks": [os.environ.get("X402_NETWORK", "eip155:8453")],
-        "mcp": {"client": "mcp_remote.py", "tool": "buy_verified_burst", "install": "INSTALL.md"},
+        "mcp": {"package": "verified-burst", "command": "verified-burst",
+                "tool": "buy_verified_burst", "install": "pip install verified-burst"},
     }
 
 
@@ -139,16 +214,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
+        base = _base_url_for(self.headers.get("Host"))
         if u.path == "/healthz":
             return self._send(200, {"ok": True})
         if u.path in ("/.well-known/x402", "/v1/info"):
             # machine-readable discovery manifest (cacheable)
-            return self._send(200, _manifest(), {"Cache-Control": "public, max-age=300"})
+            return self._send(200, _manifest(base), {"Cache-Control": "public, max-age=300"})
         if u.path == "/v1/quote":
             qs = parse_qs(u.query)
             return self._send(200, pricing.quote(
                 strategy=qs.get("strategy", ["best_of_n"])[0],
                 n=int(qs.get("n", ["3"])[0])))
+        if u.path == "/v1/burst":
+            # A bare GET on the paid resource: answer with the x402 challenge so a
+            # curious agent/dev sees HOW to pay instead of a dead-end 404. No burst
+            # runs and nothing is charged — this is discovery, not purchase. To buy,
+            # POST here with an X-PAYMENT header (charged only if the verifier passes).
+            qs = parse_qs(u.query)
+            try:
+                q = pricing.quote(strategy=qs.get("strategy", ["best_of_n"])[0],
+                                  n=int(qs.get("n", ["3"])[0]))
+            except (ValueError, KeyError):
+                q = pricing.quote()
+            return self._send(402, _discovery_402(q, base), {"Cache-Control": "public, max-age=60"})
         return self._send(404, {"error": "not_found"})
 
     def _client_ip(self):
