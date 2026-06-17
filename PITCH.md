@@ -156,3 +156,61 @@ when it's verified.
   verifier passing.
 - **"Custody?"** You hold your wallet; payments settle directly to the provider on
   chain. Self-hosted facilitator, no third party holding funds.
+
+---
+
+## Launch day — Show HN playbook (ready to paste)
+
+**tl;dr for the top of the post body** (sets framing before anyone scrolls):
+
+> tl;dr — One MCP tool that gives an agent a go/no-go gate at irreversible
+> decisions: best-of-N + a verifier, paid sub-cent over x402 only if it passes,
+> with a hard wallet spend cap. No API key to try (first 3 bursts free, then BYOK).
+> Live on Base mainnet, no users yet — looking for first builders and honest critique.
+
+**Pinned first comment** (post within a minute of submitting, before other comments land):
+
+> (OP here.) Quick context on what this is and isn't, since a few things are easy to overclaim.
+>
+> The honest pitch: agents run a cheap model by default and occasionally get a high-stakes call confidently wrong. This is one MCP tool for those moments — at a checkable decision it samples best-of-N, runs a verifier, and returns a go/no-go gate, settling a sub-cent fee over x402 only when it passes. The point isn't "more intelligence," it's a circuit breaker with a hard spend cap you can let an agent act under unattended.
+>
+> The part I'm least sure about and would most like pushback on: the verifier. Right now "verified" means a checkable answer (label/number/JSON/yes-no) cleared a self-consistency / deterministic / judge check. That's agreement, not ground truth — it reduces confident-wrong commits, it doesn't prove correctness, and it's useless for open-ended prose. I think that's a useful gate for irreversible agent actions, but if you think it's the wrong abstraction, I'd genuinely rather hear it now.
+>
+> No outside users yet — looking for first builders and honest critique. It's live on Base mainnet, BYOK after a 3-burst no-key trial. Happy to go deep on the x402 flow, the abuse model, or the economics.
+
+**Tactics:** lead every reply by conceding the true part before correcting; end with
+"what would you call it?" / "what would you want?" to invite a follow-up (keeps the
+post on the front page); restate "no users yet" in your own voice to pre-empt
+vaporware/astroturf suspicion. Post to one venue at a time; reply fast in the first hour.
+
+### Reply drafts for predictable comments
+
+**"Self-consistency isn't correctness — 'pay only if verified' is overclaiming."** *(most likely, concede hard)*
+> You're right that it's not a correctness oracle, and I should be precise about what "verified" means. The verifier gates on a *checkable* answer — a label, number, JSON field, or yes/no — using self-consistency (do N independent samples agree), a deterministic check where one exists, or a judge pass. Agreement reduces the chance of a confident-but-wrong commit; it doesn't prove ground truth, and for open-ended prose it's the wrong tool entirely. The honest framing is "don't act on a shaky answer," not "guaranteed right." If "verified" reads as a stronger claim than that, the wording needs fixing — what would you call it?
+
+**"Isn't this just reselling Cerebras / a thin wrapper?"**
+> No reselling — it's BYOK, so the tokens bill to your own provider key at your own rate limit. The fee (fractions of a cent) is for the routing + best-of-N orchestration + the verifier gate + x402 settlement, not a token markup. If you already wire best-of-N and a verifier yourself, you don't need this; it's the off-the-shelf version with payment rails and a hard spend cap attached.
+
+**"Why would an agent pay instead of just re-prompting locally?"**
+> For most steps it shouldn't — cheap re-prompting is what it already does. This is for the irreversible fork where being wrong is expensive and the answer is checkable: before it signs a swap, writes an extracted field, or runs a migration. The value isn't "more thinking," it's a go/no-go gate plus a spend cap you can safely let it act under unattended.
+
+**"x402/crypto is a solution looking for a problem — why not Stripe or an API key?"**
+> Fair challenge. For a human-operated app, Stripe is better and I wouldn't reach for this. The narrow case where per-call crypto actually buys something: an *agent* acting on its own can't sign up for a monthly plan or hold a card, but it can spend from a wallet you fund and cap. If you don't believe autonomous agent spend is real yet, this whole category is a bet — I'd agree it's early.
+
+**"What stops someone farming the free trial for inference?"**
+> The trial counter is keyed on the x402 payer address and the gate runs *after* payment is verified — so every trial burst already requires a funded wallet that paid the fee. There's no unpaid path that triggers a burst, so there's no free inference to drain; after the first 3 you bring your own key.
+
+**"Self-hosted facilitator — single point of failure? Who holds the funds?"**
+> You hold your own wallet; settlement goes on-chain directly to the provider address, so nobody custodies your funds in between. Self-hosted means there's no third-party facilitator I depend on or that holds money — the tradeoff is it's my uptime, not Coinbase's. Reasonable thing to be skeptical of for production.
+
+**"Which models? Only Cerebras = lock-in."**
+> Today it routes to Cerebras (gpt-oss-120b, zai-glm-4.7) because that's the fast-silicon tier that makes best-of-N cheap to run concurrently. BYOK means you're not locked to my account, but you're right it's single-provider right now — multi-provider routing is the obvious next step if anyone actually wants it.
+
+**"Numbers? Latency, cost?"**
+> Best-of-3 fans out concurrently in ~0.24s on Cerebras. Service fee is $0.004/burst; your own tokens for a best-of-3 run ~$0.0012 on your key. So a verified burst is well under a cent all-in. Happy to share more detail on any part.
+
+**"Is it open source?"**
+> The client you install (`verified-burst` on PyPI) is open and does the x402 signing locally — no server secrets in it. The broker server is private right now. If there's interest I'd consider opening it; not much of a moat in the plumbing.
+
+**"Letting agents spend money autonomously is a security nightmare."**
+> That's basically the thesis for why the guardrails are the product, not the inference. Hard per-wallet spend cap enforced on-chain (can't exceed what you fund), pay-only-if-it-passes, and a gate that returns *hold* so the agent stops instead of acting on a bad answer. It's meant to be the circuit breaker, not the thing that yolos a transaction.
