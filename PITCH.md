@@ -71,16 +71,28 @@ You can try it with just a Base wallet and a few cents — **no API key of your 
 Your first 3 bursts run on the host key; after that you bring your own (BYOK).
 
 The idea: agents run a cheap model by default, then quietly get the high-stakes call
-wrong. `buy_verified_burst` is one MCP tool for those moments. At a hard decision the
-agent escalates to fast silicon (Cerebras), samples best-of-N, runs the answers
-through a verifier, and pays a few tenths of a cent over x402 — but **only if the
-answer passes the verifier.** A wrong or unverifiable answer costs nothing.
+wrong. `buy_verified_burst` is one MCP tool for those moments. At a checkable decision
+the agent samples best-of-N (on your own key), runs the answers through a verifier, and
+gets back a **go/no-go gate** — `proceed` when the samples agree, `hold` when they don't,
+so your agent holds and escalates instead of acting on a shaky answer. The few-tenths-of-
+a-cent fee settles over x402 **only when it verifies**; a miss waives the fee (you still
+pay your own provider tokens). Think of it less as "buy more thinking" and more as a
+**circuit breaker for an agent's irreversible decisions.**
+
+Use it when the agent is acting unattended, the call is consequential, and the answer is
+checkable (a label, number, JSON field, or yes/no):
+
+- **Your agent spends money.** Before it signs a swap or buys, verify the contract/SKU — `hold` stops it acting on a hallucinated or injected target, and the wallet can't be drained past what you fund. (All three rails fire here: gate + hard spend cap + on-chain receipt.)
+- **Extraction at scale.** Only commit a field when N samples agree — a split routes the row to review instead of silently writing `$42,100` where the answer was `$4,210`.
+- **Irreversible ops.** Before a migration / force-push / delete, gate on "is this safe and reversible?" — the agent holds instead of dropping a production table.
+
+Not for open-ended prose or low-stakes steps — the verifier checks a checkable answer, not creative output.
 
 - No key to start: first 3 bursts run on the host key, then BYOK (your own Cerebras key — your tokens, your rate limit).
-- Pay-only-if-verified: the verifier gates settlement, so purchase risk is ~0.
+- Pay-only-if-verified: the verifier gates the service fee (a miss is free; your own tokens still apply).
+- Hard spend cap: the agent pays from a wallet you fund and can't spend past it — enforced on-chain, not honor-system.
 - x402 micropayments: per-call USDC on Base, no subscription, no human in the loop.
 - Self-hosted settlement: no third-party facilitator holding funds.
-- Budget-capped per wallet, so autonomous spend is safe to enable.
 
 One line to install: `pip install verified-burst`, then drop it into any MCP client
 with a Base wallet key. Live on Base mainnet, listed on x402scan, no outside users
