@@ -21,6 +21,7 @@ import env; env.load_env()
 import pricing
 import broker
 import burst
+import provider
 
 # --- hardening knobs -------------------------------------------------------- #
 BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")  # localhost only; nginx fronts TLS
@@ -77,12 +78,23 @@ _DEMO_PROMPTS = [
      "answer_key": ("regex", r"(?i)\b(positive|negative|neutral)\b")},
     {"topic": "verifiable check", "request": "Is 2024 a leap year? Answer yes or no.",
      "answer_key": ("regex", r"(?i)\b(yes|no)\b")},
+    {"topic": "pre-transaction guard", "request": "An agent is about to send a payment to this "
+     "address: 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 . Is that a syntactically valid "
+     "Ethereum address (0x followed by exactly 40 hexadecimal characters)? Answer yes or no.",
+     "answer_key": ("regex", r"(?i)\b(yes|no)\b")},
 ]
 
 _DEMO_LOCK = threading.Lock()
 _DEMO_DAY = [None]            # current UTC date (counters reset when this rolls over)
 _DEMO_GLOBAL = [0]           # demos served today across all IPs
 _DEMO_IP = defaultdict(int)  # demos served today per IP
+
+
+def _demo_call_fn(msgs, temperature=0.0):
+    """Demo runs on the HOST key with a roomier token budget — gpt-oss-120b is a
+    reasoning model, and prompts that make it 'think' (e.g. validating a 40-char
+    address) can exhaust a 256 cap on hidden reasoning and emit empty content."""
+    return provider.chat(msgs, temperature=temperature, max_tokens=512)
 
 
 def _demo_allow(ip):
@@ -378,8 +390,8 @@ class Handler(BaseHTTPRequestHandler):
             p = _DEMO_PROMPTS[idx]
             try:
                 res = burst.run_burst(p["request"], strategy="best_of_n", n=3,
-                                      verifier="self_consistency",
-                                      answer_key=p["answer_key"], receipt_id="demo")
+                                      verifier="self_consistency", answer_key=p["answer_key"],
+                                      receipt_id="demo", call_fn=_demo_call_fn)
             except Exception:
                 return self._send(503, {
                     "error": "demo_unavailable",
