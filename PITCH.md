@@ -13,6 +13,7 @@ user counts) — the honesty is the moat.
 - Pay-per-correct-answer inference for agents. x402 micropay, verified, one MCP line.
 - The toll booth on agent cognition: escalate at hard forks, charged only if verified.
 - **Try it with just a Base wallet — no API key. First 3 bursts on us.**
+- **Try it live in your browser — no wallet, no key.** See the answer and the proceed/hold gate at https://burst.solcleus.com
 
 ---
 
@@ -27,8 +28,11 @@ and pays per call over x402 stablecoin — **charged only if the answer passes.*
 non-verified result costs nothing. No subscription, no human in the loop, spend
 capped per wallet so you can safely let the agent buy on its own.
 
+- **Try it before anything.** Hit "Fire a burst" on the landing page — a real
+  verified burst runs in your browser, no wallet, no key. See the answer and the
+  proceed/hold gate live: https://burst.solcleus.com
 - **No key to start.** Your first 3 bursts run on the host key — bring only a
-  funded Base wallet. After that, BYOK. Lowest-friction way to try it.
+  funded Base wallet. After that, BYOK.
 - **Pay only if verified.** The verifier gates the charge. Risk-free purchase.
 - **Fast.** Best-of-N runs concurrently on Cerebras — a 3-sample burst in ~0.24s.
 - **BYOK.** Bring your own provider key; your tokens, your rate limit. We sell
@@ -39,6 +43,9 @@ capped per wallet so you can safely let the agent buy on its own.
 ---
 
 ## Install (the one-liner)
+
+Want to see it work first? **Fire a real verified burst in your browser — no wallet,
+no key:** https://burst.solcleus.com (click "Fire a burst").
 
 ```bash
 pip install verified-burst      # or zero-install: uvx verified-burst
@@ -62,6 +69,7 @@ your tokens, your rate limit). Full guide: INSTALL.md.
 
 **Live links (use these, all true today):**
 - Landing/endpoint: https://burst.solcleus.com
+- Try it live (no wallet, no key): https://burst.solcleus.com — click "Fire a burst" (or `GET /v1/burst/demo` for JSON)
 - Install: https://pypi.org/project/verified-burst/  (`pip install verified-burst`)
 - x402scan listing: https://www.x402scan.com/server/d09b513d-cefa-46de-a1c8-34189026c408
 - Settlement proof (BaseScan): https://basescan.org/tx/0x76921c33f6c83e78757b8218c101ac362ab19ba994ded6743b9bbb2defd359c4
@@ -71,9 +79,11 @@ your tokens, your rate limit). Full guide: INSTALL.md.
 **Title:** `Show HN: Verified Burst – agents buy inference over x402, pay only if it's correct`
 **URL:** `https://burst.solcleus.com`
 
-**Text:** (lead with the no-key trial — lowest barrier to try)
-You can try it with just a Base wallet and a few cents — **no API key of your own.**
-Your first 3 bursts run on the host key; after that you bring your own (BYOK).
+**Text:** (lead with the in-browser demo — zero barrier to try)
+**Try it right now in your browser — no wallet, no key:** click "Fire a burst" at
+https://burst.solcleus.com and a real verified burst runs and shows you the proceed/hold
+gate. When you want to wire it into an agent, you can start with just a Base wallet and a
+few cents — your first 3 bursts run on the host key, then you bring your own key (BYOK).
 
 The idea: agents run a cheap model by default, then quietly get the high-stakes call
 wrong. `buy_verified_burst` is one MCP tool for those moments. At a checkable decision
@@ -93,6 +103,7 @@ checkable (a label, number, JSON field, or yes/no):
 
 Not for open-ended prose or low-stakes steps — the verifier checks a checkable answer, not creative output.
 
+- Try before you wire anything: a live "fire a burst" demo runs in your browser, no wallet, no key.
 - No key to start: first 3 bursts run on the host key, then BYOK (your own Cerebras key — your tokens, your rate limit).
 - Pay-only-if-verified: the verifier gates the service fee (a miss is free; your own tokens still apply).
 - Hard spend cap: the agent pays from a wallet you fund and can't spend past it — enforced on-chain, not honor-system.
@@ -108,8 +119,8 @@ abstraction") very welcome.
 
 **Title:** `MCP tool: your agent buys a "verified inference burst" and pays only if the answer passes a verifier (no API key needed to start)`
 
-Same body as above — keep the no-key-trial line first; it's the biggest friction
-drop for a first user (just a Base wallet, no Cerebras key for the first 3 bursts).
+Same body as above — keep the in-browser "fire a burst" demo line first; it's a
+zero-friction try (no wallet, no key), an even lower bar than the 3-burst trial.
 NOTE: trial count is the `BURST_TRIAL_BURSTS` env value (3 today) — keep the copy in
 sync if you change it.
 
@@ -165,8 +176,9 @@ when it's verified.
 
 > tl;dr — One MCP tool that gives an agent a go/no-go gate at irreversible
 > decisions: best-of-N + a verifier, paid sub-cent over x402 only if it passes,
-> with a hard wallet spend cap. No API key to try (first 3 bursts free, then BYOK).
-> Live on Base mainnet, no users yet — looking for first builders and honest critique.
+> with a hard wallet spend cap. Try it live in your browser (no wallet, no key) at
+> https://burst.solcleus.com; wire it into an agent with no API key for the first 3
+> bursts, then BYOK. Live on Base mainnet, no users yet — looking for first builders.
 
 **Pinned first comment** (post within a minute of submitting, before other comments land):
 
@@ -175,6 +187,8 @@ when it's verified.
 > The honest pitch: agents run a cheap model by default and occasionally get a high-stakes call confidently wrong. This is one MCP tool for those moments — at a checkable decision it samples best-of-N, runs a verifier, and returns a go/no-go gate, settling a sub-cent fee over x402 only when it passes. The point isn't "more intelligence," it's a circuit breaker with a hard spend cap you can let an agent act under unattended.
 >
 > The part I'm least sure about and would most like pushback on: the verifier. Right now "verified" means a checkable answer (label/number/JSON/yes-no) cleared a self-consistency / deterministic / judge check. That's agreement, not ground truth — it reduces confident-wrong commits, it doesn't prove correctness, and it's useless for open-ended prose. I think that's a useful gate for irreversible agent actions, but if you think it's the wrong abstraction, I'd genuinely rather hear it now.
+>
+> If you want to see it before reading any of that: there's a "fire a burst" button at https://burst.solcleus.com that runs a real verified burst in your browser — no wallet, no key — and shows you the proceed/hold gate.
 >
 > No outside users yet — looking for first builders and honest critique. It's live on Base mainnet, BYOK after a 3-burst no-key trial. Happy to go deep on the x402 flow, the abuse model, or the economics.
 
