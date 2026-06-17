@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "verified-burst"
-version = "1.0.1"
+version = "1.1.0"
 description = "MCP client: your agent buys a verified decision and pays only when it passes a verifier — with a go/no-go gate and a hard spend cap (x402, BYOK)."
 readme = "README.md"
 requires-python = ">=3.10"

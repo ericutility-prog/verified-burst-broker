@@ -18,6 +18,7 @@ import urllib.request
 from .signing import sign_payment
 
 ENDPOINT = os.environ.get("BURST_ENDPOINT", "https://solcleus.com/v1/burst")
+BESTPRICE_ENDPOINT = os.environ.get("BESTPRICE_ENDPOINT", "https://agentsprice.com/v1/best-price")
 PROTOCOL = "2024-11-05"
 
 TOOL = {
@@ -49,10 +50,27 @@ TOOL = {
     },
 }
 
+TOOL_BESTPRICE = {
+    "name": "best_price_now",
+    "description": (
+        "Pay a micropayment (x402 stablecoin) for ONE broad, real-time best-price search across "
+        "sellers, and get back the current best price + where to buy. Charged ONLY if the search "
+        "returns real results — no info found waives the fee. Use to price a specific product right "
+        "now before buying or quoting."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to price — a product name, "
+                      "e.g. 'airpods pro' or 'ninja air fryer'."},
+        },
+        "required": ["query"],
+    },
+}
 
-def _post(body, headers=None):
+
+def _post(endpoint, body, headers=None):
     req = urllib.request.Request(
-        ENDPOINT, data=json.dumps(body).encode(),
+        endpoint, data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", **(headers or {})}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=180) as r:
@@ -61,11 +79,20 @@ def _post(body, headers=None):
         return e.code, json.loads(e.read())
 
 
-def buy(args):
-    """x402 flow: 402 challenge -> sign with the builder's wallet -> pay."""
+def _pay_flow(endpoint, body, extra_headers=None):
+    """Shared x402 flow: unpaid -> 402 challenge -> sign with the builder's wallet -> pay."""
     buyer_key = os.environ.get("BURST_BUYER_KEY")
     if not buyer_key:
-        return {"error": "BURST_BUYER_KEY not set (the wallet that pays per burst)"}
+        return {"error": "BURST_BUYER_KEY not set (the wallet that pays per call)"}
+    base = dict(extra_headers or {})
+    code, resp = _post(endpoint, body, base)                # 1) unpaid -> 402
+    if code == 402 and "accepts" in resp:
+        x_payment = sign_payment(resp["accepts"], buyer_key)  # 2) sign w/ builder wallet
+        code, resp = _post(endpoint, body, {**base, "X-PAYMENT": x_payment})  # 3) pay
+    return resp
+
+
+def buy(args):
     provider_key = os.environ.get("BURST_PROVIDER_KEY")
     body = {"request": args["request"],
             "strategy": args.get("strategy", "best_of_n"),
@@ -75,16 +102,32 @@ def buy(args):
         body["answer_key"] = args["answer_key"]
     if args.get("model"):
         body["model"] = args["model"]
+    extra = {"X-Provider-Key": provider_key} if provider_key else None
+    return _pay_flow(ENDPOINT, body, extra)
 
-    base_headers = {}
-    if provider_key:
-        base_headers["X-Provider-Key"] = provider_key
 
-    code, resp = _post(body, base_headers)                  # 1) unpaid -> 402
-    if code == 402 and "accepts" in resp:
-        x_payment = sign_payment(resp["accepts"], buyer_key)  # 2) sign w/ builder wallet
-        code, resp = _post(body, {**base_headers, "X-PAYMENT": x_payment})  # 3) pay
-    return resp
+def best_price(args):
+    q = (args.get("query") or "").strip()
+    if not q:
+        return {"error": "query is required (the product to price)"}
+    return _pay_flow(BESTPRICE_ENDPOINT, {"query": q})
+
+
+def _price_banner(resp):
+    if resp.get("error"):
+        return f"⚠️ {resp['error']}\n\n"
+    if resp.get("status") == "no_results":
+        return "ℹ️ No real results found — you were NOT charged.\n\n"
+    deals = (resp.get("result") or {}).get("deals") or []
+    if resp.get("status") == "ok" and deals:
+        top = deals[0]
+        seller = top.get("best_seller") or top.get("source") or "?"
+        tx = resp.get("tx")
+        rcpt = f" Receipt: {tx}." if tx else ""
+        return (f"💲 BEST PRICE: {top.get('name', resp.get('query',''))} — "
+                f"${top.get('best_price')} @ {seller} "
+                f"({resp.get('count', len(deals))} sellers compared).{rcpt}\n\n")
+    return ""
 
 
 def _gate_banner(resp):
@@ -113,17 +156,24 @@ def handle(msg):
     if method == "initialize":
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL, "capabilities": {"tools": {}},
-            "serverInfo": {"name": "verified-burst", "version": "1.0.1"}}}
+            "serverInfo": {"name": "verified-burst", "version": "1.1.0"}}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [TOOL]}}
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [TOOL, TOOL_BESTPRICE]}}
     if method == "tools/call":
         params = msg.get("params", {})
-        if params.get("name") != "buy_verified_burst":
-            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "unknown tool"}}
+        name = params.get("name")
         try:
-            result = buy(params.get("arguments", {}))
-            is_err = "error" in result or result.get("status") not in ("ok", "not_verified")
-            text = _gate_banner(result) + json.dumps(result, indent=2)
+            if name == "buy_verified_burst":
+                result = buy(params.get("arguments", {}))
+                is_err = "error" in result or result.get("status") not in ("ok", "not_verified")
+                text = _gate_banner(result) + json.dumps(result, indent=2)
+            elif name == "best_price_now":
+                result = best_price(params.get("arguments", {}))
+                is_err = "error" in result or result.get("status") not in ("ok", "no_results")
+                text = _price_banner(result) + json.dumps(result, indent=2)
+            else:
+                return {"jsonrpc": "2.0", "id": mid,
+                        "error": {"code": -32601, "message": "unknown tool"}}
             return {"jsonrpc": "2.0", "id": mid, "result": {
                 "content": [{"type": "text", "text": text}],
                 "isError": bool(is_err)}}
