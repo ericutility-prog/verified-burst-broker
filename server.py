@@ -20,6 +20,7 @@ from urllib.parse import urlparse, parse_qs
 import env; env.load_env()
 import pricing
 import broker
+import burst
 
 # --- hardening knobs -------------------------------------------------------- #
 BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")  # localhost only; nginx fronts TLS
@@ -52,6 +53,54 @@ def _rate_ok(ip):
             for k in [k for k, v in _HITS.items() if not v]:
                 _HITS.pop(k, None)
         return True
+
+
+# --- no-wallet "taste" demo --------------------------------------------------- #
+# ONE real verified burst on the HOST key, no wallet, no payment — so a curious dev
+# or agent sees the actual output + the proceed/hold gate before wiring anything.
+# Free inference is the abuse surface, so it's locked down: FIXED demo prompts only
+# (no arbitrary input to farm), plus per-IP and GLOBAL daily ceilings that cap the
+# host key's exposure. Resets at UTC midnight; counters are in-memory (reset on restart).
+DEMO_ENABLED = os.environ.get("BURST_DEMO", "1").lower() in ("1", "true", "yes")
+DEMO_PER_IP_DAY = int(os.environ.get("BURST_DEMO_PER_IP_DAY", "3"))
+DEMO_GLOBAL_DAY = int(os.environ.get("BURST_DEMO_GLOBAL_DAY", "100"))
+
+# Fixed, genuinely-checkable prompts whose samples reliably agree → the happy
+# "proceed" path. Honest (the answers are actually correct), not rigged.
+_DEMO_PROMPTS = [
+    {"topic": "arithmetic", "request": "What is 47 * 53? Reply with just the number.",
+     "answer_key": ("regex", r"(\d+)")},
+    {"topic": "fact lookup", "request": "What is the capital of Japan? Reply with one word.",
+     "answer_key": ("regex", r"(\w+)")},
+    {"topic": "classification", "request": "Sentiment of: 'This update broke my build and "
+     "wasted my whole afternoon.' Reply with one word: positive, negative, or neutral.",
+     "answer_key": ("regex", r"(?i)\b(positive|negative|neutral)\b")},
+    {"topic": "verifiable check", "request": "Is 2024 a leap year? Answer yes or no.",
+     "answer_key": ("regex", r"(?i)\b(yes|no)\b")},
+]
+
+_DEMO_LOCK = threading.Lock()
+_DEMO_DAY = [None]            # current UTC date (counters reset when this rolls over)
+_DEMO_GLOBAL = [0]           # demos served today across all IPs
+_DEMO_IP = defaultdict(int)  # demos served today per IP
+
+
+def _demo_allow(ip):
+    """Reserve a demo slot under the per-IP + global daily ceilings (UTC-day reset).
+    Returns (ok, reason). A slot is consumed on reserve (before the burst) so a
+    deliberately-failing caller can't farm unlimited host inference."""
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    with _DEMO_LOCK:
+        if _DEMO_DAY[0] != today:
+            _DEMO_DAY[0], _DEMO_GLOBAL[0] = today, 0
+            _DEMO_IP.clear()
+        if _DEMO_GLOBAL[0] >= DEMO_GLOBAL_DAY:
+            return False, "global_daily_cap"
+        if _DEMO_IP[ip] >= DEMO_PER_IP_DAY:
+            return False, "per_ip_daily_cap"
+        _DEMO_GLOBAL[0] += 1
+        _DEMO_IP[ip] += 1
+        return True, max(0, DEMO_PER_IP_DAY - _DEMO_IP[ip])
 
 
 PUBLIC_URL = os.environ.get("BURST_PUBLIC_URL", "https://solcleus.com").rstrip("/")
@@ -171,6 +220,7 @@ def _discovery_402(q, base=PUBLIC_URL):
                  "service fee ONLY if the answer passes the verifier — best on decisions with a "
                  "checkable answer (label, number, JSON field, yes/no). Your BYOK provider tokens "
                  "are billed regardless. GET /v1/info for the full manifest."),
+        "demo_url": (f"{base}/v1/burst/demo" if DEMO_ENABLED else None),  # try free, no wallet
         "human_url": f"{base}/burst",
     }
 
@@ -202,6 +252,7 @@ def _manifest(base=PUBLIC_URL):
             "input_schema": _INPUT_SCHEMA,
         }],
         "quote_url": f"{base}/v1/quote",
+        "demo_url": (f"{base}/v1/burst/demo" if DEMO_ENABLED else None),  # free, no-wallet taste
         "human_url": f"{base}/burst",
         "facilitator": "self-hosted",
         # Why an agent owner can let this run unattended — the anti-haywire guarantees.
@@ -302,6 +353,55 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, KeyError):
                 q = pricing.quote()
             return self._send(402, _discovery_402(q, base), {"Cache-Control": "public, max-age=60"})
+        if u.path == "/v1/burst/demo":
+            # No-wallet taste: run ONE real verified burst on the host key, free, so a
+            # curious dev/agent sees the actual answer + proceed/hold gate before wiring
+            # a wallet. Fixed prompts + daily caps keep it from becoming free open inference.
+            if not DEMO_ENABLED:
+                return self._send(404, {"error": "not_found"})
+            ok = _demo_allow(self._client_ip())
+            if not ok[0]:
+                return self._send(429, {
+                    "error": "demo_limit", "reason": ok[1],
+                    "hint": ("the free demo's daily limit is reached — to run your OWN "
+                             "decisions now, install the tool (pay-per-correct over x402)"),
+                    "install": "pip install verified-burst",
+                    "human_url": f"{base}/burst"}, {"Retry-After": "3600"})
+            remaining = ok[1]
+            qs = parse_qs(u.query)
+            try:
+                idx = int(qs.get("example", ["-1"])[0])
+            except ValueError:
+                idx = -1
+            if not (0 <= idx < len(_DEMO_PROMPTS)):
+                idx = _DEMO_GLOBAL[0] % len(_DEMO_PROMPTS)  # rotate for variety
+            p = _DEMO_PROMPTS[idx]
+            try:
+                res = burst.run_burst(p["request"], strategy="best_of_n", n=3,
+                                      verifier="self_consistency",
+                                      answer_key=p["answer_key"], receipt_id="demo")
+            except Exception:
+                return self._send(503, {
+                    "error": "demo_unavailable",
+                    "hint": "host model is busy — retry shortly, or run your own: pip install verified-burst"})
+            return self._send(200, {
+                "demo": True,
+                "note": ("Free taste on the host key — no wallet, no payment, no charge. This is "
+                         "a FIXED demo prompt; to run YOUR own decisions, install the tool below."),
+                "topic": p["topic"],
+                "prompt": p["request"],
+                "answer": res.answer,
+                "gate": broker._gate_signal(res),       # the real product output: proceed | hold
+                "verified": res.passed,
+                "verifier": (res.verdict or {}).get("method"),
+                "samples": res.n,
+                "latency_s": round(res.latency_s, 3),
+                "demo_remaining_today": remaining,
+                "examples_available": len(_DEMO_PROMPTS),
+                "install": "pip install verified-burst",
+                "buy_your_own": f"{base}/v1/info",
+                "human_url": f"{base}/burst",
+            }, {"Cache-Control": "no-store"})
         return self._send(404, {"error": "not_found"})
 
     def _client_ip(self):
