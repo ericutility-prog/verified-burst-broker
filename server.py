@@ -73,13 +73,19 @@ def _base_url_for(host_header):
 _INPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "request": {"type": "string", "description": "The decision/question to resolve."},
+        "request": {"type": "string", "description": "The decision to resolve. Verifies best "
+                    "when the answer is checkable — a label, number, JSON field, or yes/no."},
         "strategy": {"type": "string", "enum": ["fast", "best_of_n"], "default": "best_of_n"},
         "n": {"type": "integer", "default": 3},
         "verifier": {"type": "string", "enum": ["self_consistency", "judge", "none"],
-                     "default": "self_consistency"},
+                     "default": "self_consistency",
+                     "description": "How the answer is checked before you're charged: "
+                     "self_consistency = N-of-M samples agree (pair with answer_key); "
+                     "judge = adversarial LLM check; none = no gate (always charged)."},
         "answer_key": {"type": "array", "items": {"type": "string"},
-                       "description": 'Optional ["json","<field>"] or ["regex","(<pat>)"].'},
+                       "description": 'How to extract the comparable answer for self_consistency '
+                       '— ["json","<field>"] or ["regex","(<pat>)"]. Recommended: without it, '
+                       'agreement is measured on the full answer text and rarely matches on prose.'},
         "model": {"type": "string", "description": "Optional model (must match your BYOK key)."},
     },
     "required": ["request"],
@@ -89,10 +95,14 @@ _OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "status": {"type": "string", "description": "ok | not_verified | payment_required | budget_exceeded"},
-        "answer": {"type": "string", "description": "The verified answer (present when status=ok)."},
-        "verified": {"type": "boolean", "description": "Whether the verifier passed (gates the charge)."},
-        "charged": {"type": "boolean", "description": "True only if verified; you pay nothing otherwise."},
-        "amount_usd": {"type": "number", "description": "Service fee charged on a verified burst."},
+        "answer": {"type": "string", "description": "The passing answer (present when status=ok)."},
+        "gate": {"type": "object", "description": "Machine-first go/no-go for your agent's NEXT "
+                 "step — not just billing. `action`='proceed' when verified, 'hold' when not "
+                 "(don't act on the answer; re-try or escalate). Carries `confidence` + `advice`."},
+        "verified": {"type": "boolean", "description": "Whether the verifier passed (gates the fee)."},
+        "charged": {"type": "boolean", "description": "True only when the verifier passed — this is "
+                    "the service fee. Your own BYOK provider tokens are billed regardless."},
+        "amount_usd": {"type": "number", "description": "Service fee charged on a passing burst (BYOK tokens are separate)."},
         "settle_tx": {"type": "string", "description": "On-chain settlement tx hash when charged."},
         "remaining_budget_usd": {"type": "number", "description": "Wallet budget left after this call."},
     },
@@ -122,7 +132,8 @@ def _resource_info(base=PUBLIC_URL):
     """x402 v2 top-level `resource` object."""
     return {
         "url": f"{base}/v1/burst",
-        "description": "Buy a verified inference burst. Pay only if the verifier passes.",
+        "description": "Buy a verified decision: best-of-N on your own key, charged the service "
+                       "fee ONLY when the verifier passes (agreement / judge / your check). A miss is free.",
         "mimeType": "application/json",
         "serviceName": "Verified Burst",
     }
@@ -156,9 +167,10 @@ def _discovery_402(q, base=PUBLIC_URL):
         "extensions": _bazaar_ext(),
         # Human/agent-friendly extras (ignored/stripped by x402 validators):
         "quote": q,
-        "hint": ("POST to this URL with an X-PAYMENT header to buy a verified burst — "
-                 "you are charged ONLY if the answer passes the verifier. "
-                 "GET /v1/info for the full manifest."),
+        "hint": ("POST with an X-PAYMENT header to buy a verified decision. You're charged the "
+                 "service fee ONLY if the answer passes the verifier — best on decisions with a "
+                 "checkable answer (label, number, JSON field, yes/no). Your BYOK provider tokens "
+                 "are billed regardless. GET /v1/info for the full manifest."),
         "human_url": f"{base}/burst",
     }
 
@@ -169,14 +181,17 @@ def _manifest(base=PUBLIC_URL):
     return {
         "x402Version": 2,
         "name": "Verified Burst",
-        "description": ("Pay-per-correct-answer inference bursts for agents: escalate to fast "
-                        "silicon, sample best-of-N, verify, and settle over x402 — charged ONLY "
-                        "if the answer passes a verifier. BYOK; self-hosted settlement."),
+        "description": ("Pay-per-checkable-decision inference for agents. Give it a decision with a "
+                        "checkable answer (a label, number, JSON field, or yes/no); it samples "
+                        "best-of-N on your own key (BYOK) and settles a few tenths of a cent over "
+                        "x402 ONLY when the samples agree — or a judge/your-own-check passes. The "
+                        "verifier gates the service fee; a miss is free. Self-hosted settlement on Base."),
         "resources": [{
             "method": "POST",
             "path": "/v1/burst",
             "url": f"{base}/v1/burst",
-            "description": "Buy a verified inference burst. Pay only if the verifier passes.",
+            "description": "Buy a verified decision: best-of-N on your own key, charged the service "
+                       "fee ONLY when the verifier passes (agreement / judge / your check). A miss is free.",
             "price": {"display": f"${q['price_usd']}",
                       "amount": str(int(round(q['price_usd'] * 1e6))),
                       "currency": "USDC", "decimals": 6},
@@ -189,6 +204,20 @@ def _manifest(base=PUBLIC_URL):
         "quote_url": f"{base}/v1/quote",
         "human_url": f"{base}/burst",
         "facilitator": "self-hosted",
+        # Why an agent owner can let this run unattended — the anti-haywire guarantees.
+        "safety": {
+            "spend_ceiling": ("The agent pays from a wallet you fund; it cannot spend beyond that "
+                              "balance — the ceiling is the funding, enforced on-chain, not our "
+                              "honor system."),
+            "spend_governor_usd": broker.DEFAULT_BUDGET_USD,
+            "spend_governor_note": ("Secondary per-wallet cap the broker enforces between top-ups "
+                                    "(refuses a burst that would exceed it); response carries "
+                                    "remaining_budget_usd."),
+            "decision_gate": ("Every response carries gate.action ('proceed'|'hold') so the verdict "
+                              "gates your agent's NEXT step, not just the charge — hold and escalate "
+                              "instead of acting on an unverified answer."),
+            "audit": "Every charged burst returns an on-chain settle_tx — a verifiable receipt of what the agent decided and paid for.",
+        },
         "networks": [os.environ.get("X402_NETWORK", "eip155:8453")],
         "mcp": {"package": "verified-burst", "command": "verified-burst",
                 "tool": "buy_verified_burst", "install": "pip install verified-burst"},

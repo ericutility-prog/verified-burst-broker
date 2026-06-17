@@ -44,6 +44,24 @@ def remaining_budget(payer, cap=DEFAULT_BUDGET_USD):
     return max(0.0, cap - _SPENT.get(payer, 0.0))
 
 
+def _gate_signal(res):
+    """Machine-first go/no-go — the point of the product against 'agents going haywire'.
+    The verdict gates the agent's NEXT STEP, not just the charge: an agent (or the MCP
+    wrapper) reads `action` and HOLDS instead of acting on an unverified answer. We can't
+    force a client to obey, but we return an unambiguous verdict it can gate on."""
+    v = res.verdict or {}
+    conf = v.get("agreement")  # self_consistency exposes a fraction; judge/check -> None
+    if res.passed:
+        return {"verified": True, "action": "proceed",
+                "advice": "Answer passed the verifier — safe to act on.",
+                "method": v.get("method"), "confidence": conf}
+    return {"verified": False, "action": "hold",
+            "advice": ("Answer did NOT pass the verifier — DO NOT act on it. Re-try, "
+                       "escalate to a human, or treat the decision as unresolved."),
+            "method": v.get("method"), "confidence": conf,
+            "reason": v.get("reason") or v.get("votes")}
+
+
 def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
                 verifier="self_consistency", answer_key=None, check=None,
                 budget_cap=DEFAULT_BUDGET_USD, facilitator=None, call_fn=None,
@@ -99,16 +117,21 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     # 5) settle ONLY if the verifier passed — else discard the authorization (no charge)
     if not res.passed:
         return {"status": "not_verified", "charged": False, "price_usd": 0.0,
+                "gate": _gate_signal(res),               # action=hold — don't act on this answer
                 "verdict": res.verdict, "answer": res.answer, "payer": payer,
                 "latency_s": res.latency_s, "cost_basis": res.cost_basis,
+                "remaining_budget_usd": round(remaining_budget(payer, budget_cap), 6),
+                "budget_cap_usd": budget_cap,
                 "trial": is_trial, "trial_remaining": trial_remaining}
 
     s = fac.settle(x_payment, reqs)
     if s["success"]:
         _SPENT[payer] = _SPENT.get(payer, 0.0) + q["price_usd"]
     return {"status": "ok", "charged": bool(s["success"]), "price_usd": q["price_usd"],
+            "gate": _gate_signal(res),                   # action=proceed — verified, safe to act
             "tx": s.get("tx"), "mode": s.get("mode"), "verdict": res.verdict,
             "answer": res.answer, "payer": payer, "latency_s": res.latency_s,
             "cost_basis": res.cost_basis, "receipt_id": res.receipt_id,
             "remaining_budget_usd": round(remaining_budget(payer, budget_cap), 6),
+            "budget_cap_usd": budget_cap,
             "trial": is_trial, "trial_remaining": trial_remaining}

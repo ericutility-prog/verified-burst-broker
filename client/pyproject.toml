@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "verified-burst"
-version = "1.0.0"
-description = "MCP client: your agent buys verified inference bursts and pays only if the answer is correct (x402, BYOK)."
+version = "1.0.1"
+description = "MCP client: your agent buys a verified decision and pays only when it passes a verifier — with a go/no-go gate and a hard spend cap (x402, BYOK)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

@@ -6,9 +6,10 @@ secrets), this is a pure CLIENT: it talks to the hosted verified-burst endpoint
 over HTTPS, pays per call with the BUILDER's OWN wallet via x402, and optionally
 brings the builder's OWN Cerebras key (BYOK). It holds none of our secrets.
 
-An agent gains one tool — buy_verified_burst — and at a hard fork it escalates to
-fast silicon, samples best-of-N, gates the answer through a verifier, and pays
-(stablecoin, x402) ONLY if the answer passes. Budget-capped server-side.
+An agent gains one tool — buy_verified_burst — and at a hard fork (best when the
+answer is checkable) it samples best-of-N on the buyer's own key, gates the answer
+through a verifier, and pays the service fee (stablecoin, x402) ONLY if it passes.
+Budget-capped server-side.
 
 Install (one line in an MCP client config):
   { "mcpServers": { "verified-burst": {
@@ -44,20 +45,26 @@ PROTOCOL = "2024-11-05"
 TOOL = {
     "name": "buy_verified_burst",
     "description": (
-        "Buy a verified inference burst at a hard/irreversible/low-confidence decision. "
-        "Escalates to fast silicon, samples best-of-N, gates the answer through a verifier, "
-        "and pays (x402 stablecoin) ONLY if it passes. Returns the verified answer + receipt. "
-        "Use when getting it wrong is costly."),
+        "Buy a verified decision at a hard/irreversible/low-confidence fork — best when the answer "
+        "is checkable (a label, number, JSON field, or yes/no). Samples best-of-N on your own key, "
+        "gates the answer through a verifier (samples agree / judge / your check), and pays the "
+        "service fee (x402 stablecoin) ONLY if it passes — a miss waives the fee (your BYOK tokens "
+        "still apply). Returns the passing answer + receipt. Use when getting it wrong is costly."),
     "inputSchema": {
         "type": "object",
         "properties": {
-            "request": {"type": "string", "description": "The decision/question to resolve."},
+            "request": {"type": "string", "description": "The decision to resolve. Verifies best "
+                        "when the answer is checkable — a label, number, JSON field, or yes/no."},
             "strategy": {"type": "string", "enum": ["fast", "best_of_n"], "default": "best_of_n"},
             "n": {"type": "integer", "default": 3, "description": "best-of-N sample count."},
             "verifier": {"type": "string", "enum": ["self_consistency", "judge", "none"],
-                         "default": "self_consistency"},
+                         "default": "self_consistency",
+                         "description": "self_consistency = N-of-M samples agree (pair with "
+                         "answer_key); judge = adversarial LLM check; none = no gate."},
             "answer_key": {"type": "array", "items": {"type": "string"},
-                           "description": 'Optional ["json","<field>"] or ["regex","(<pat>)"] to normalize answers.'},
+                           "description": 'How to extract the comparable answer for self_consistency '
+                           '— ["json","<field>"] or ["regex","(<pat>)"]. Recommended; without it, '
+                           'agreement is measured on the full text and rarely matches on prose.'},
             "model": {"type": "string", "description": "Optional model override (must match your BYOK key)."},
         },
         "required": ["request"],
@@ -100,13 +107,30 @@ def buy(args):
     return resp
 
 
+def _gate_banner(resp):
+    """Hoist the go/no-go to the FIRST line the agent reads — the verdict gates the
+    agent's next step, not just the charge (the anti-haywire point)."""
+    g = resp.get("gate") or {}
+    c = g.get("confidence")
+    conf = f" (confidence {c})" if c is not None else ""
+    if g.get("action") == "hold":
+        return (f"⛔ GATE: HOLD — the answer did NOT pass the verifier{conf}. "
+                "DO NOT act on it; re-try, escalate to a human, or treat the decision as "
+                "unresolved. You were NOT charged.\n\n")
+    if g.get("action") == "proceed":
+        tx = resp.get("tx")
+        rcpt = f" Receipt: {tx}." if tx else ""
+        return f"✅ GATE: PROCEED — answer passed the verifier{conf}. Safe to act on.{rcpt}\n\n"
+    return ""
+
+
 def handle(msg):
     mid = msg.get("id")
     method = msg.get("method")
     if method == "initialize":
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": PROTOCOL, "capabilities": {"tools": {}},
-            "serverInfo": {"name": "verified-burst", "version": "1.0.0"}}}
+            "serverInfo": {"name": "verified-burst", "version": "1.0.1"}}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [TOOL]}}
     if method == "tools/call":
@@ -116,8 +140,9 @@ def handle(msg):
         try:
             result = buy(params.get("arguments", {}))
             is_err = result.get("status") not in ("ok", "not_verified") or "error" in result
+            text = _gate_banner(result) + json.dumps(result, indent=2)
             return {"jsonrpc": "2.0", "id": mid, "result": {
-                "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                "content": [{"type": "text", "text": text}],
                 "isError": bool(is_err)}}
         except Exception as e:
             return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": f"{type(e).__name__}: {e}"}}
