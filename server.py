@@ -22,6 +22,7 @@ import pricing
 import broker
 import burst
 import provider
+import bestprice
 
 # --- hardening knobs -------------------------------------------------------- #
 BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")  # localhost only; nginx fronts TLS
@@ -365,6 +366,19 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, KeyError):
                 q = pricing.quote()
             return self._send(402, _discovery_402(q, base), {"Cache-Control": "public, max-age=60"})
+        if u.path == "/v1/best-price":
+            # Discovery: a bare GET returns the x402 challenge for the paid real-time
+            # best-price search. POST here with a query + X-PAYMENT to run it; charged
+            # only if the search returns real results.
+            q = pricing.quote()
+            return self._send(402, {
+                "x402Version": 2, "error": "payment_required",
+                "resource": {"url": f"{base}/v1/best-price", "serviceName": "Best Price Now",
+                             "description": "One micropayment buys one broad, real-time best-price search."},
+                "accepts": _accepts_for(q["price_usd"]), "quote": q,
+                "hint": ("POST {\"query\":\"<what to price>\"} with an X-PAYMENT header. "
+                         "Charged only if the search returns real results — no info, no charge."),
+                "human_url": f"{base}/burst"}, {"Cache-Control": "public, max-age=60"})
         if u.path == "/v1/burst/demo":
             # No-wallet taste: run ONE real verified burst on the host key, free, so a
             # curious dev/agent sees the actual answer + proceed/hold gate before wiring
@@ -425,12 +439,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
-        if u.path != "/v1/burst":
+        if u.path not in ("/v1/burst", "/v1/best-price"):
             return self._send(404, {"error": "not_found"})
         if not _rate_ok(self._client_ip()):
             return self._send(429, {"error": "rate_limited", "retry_after_s": 60},
                               {"Retry-After": "60"})
         base = _base_url_for(self.headers.get("Host"))
+        if u.path == "/v1/best-price":
+            return self._do_best_price(base)
         ex = _example(base)  # worked example attached to every 4xx so bouncers self-correct
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -483,6 +499,38 @@ class Handler(BaseHTTPRequestHandler):
         if result["status"] == "budget_exceeded":
             return self._send(402, result)
         # not_verified -> 200 with charged:false (honest: no charge); ok -> 200 charged:true
+        hdrs = {"X-PAYMENT-RESPONSE": result["tx"]} if result.get("tx") else None
+        return self._send(200, result, hdrs)
+
+    def _do_best_price(self, base):
+        """Paid real-time best-price search — reuses the proven x402 money-path
+        (verify -> search -> settle-IF-results). Charged only if real data returns."""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return self._send(400, {"error": "bad_length"})
+        if n > MAX_BODY:
+            return self._send(413, {"error": "request_too_large", "max_bytes": MAX_BODY})
+        try:
+            req = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return self._send(400, {"error": "bad_json", "detail": "body must be JSON"})
+        query = (req.get("query") or req.get("q") or "").strip()
+        if not query:
+            return self._send(400, {"error": "missing 'query'",
+                                    "detail": "include a 'query' field — what to price",
+                                    "example": {"query": "airpods pro"}})
+        if len(query) > MAX_REQ_CHARS:
+            return self._send(413, {"error": "query_too_long", "max_chars": MAX_REQ_CHARS})
+
+        result = bestprice.serve_search(query, x_payment=self.headers.get("X-PAYMENT"))
+
+        if result["status"] == "payment_required":
+            return self._send(402, {"x402Version": 1, "accepts": result["accepts"],
+                                    "quote": result["quote"], "error": "payment_required"})
+        if result["status"] == "budget_exceeded":
+            return self._send(402, result)
+        # no_results -> 200 charged:false (honest: no info, no charge); ok -> charged:true
         hdrs = {"X-PAYMENT-RESPONSE": result["tx"]} if result.get("tx") else None
         return self._send(200, result, hdrs)
 
