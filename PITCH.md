@@ -12,6 +12,7 @@ user counts) — the honesty is the moat.
 - **Verified Burst — your agent buys more thinking, and pays only if it's right.**
 - Pay-per-correct-answer inference for agents. x402 micropay, verified, one MCP line.
 - The toll booth on agent cognition: escalate at hard forks, charged only if verified.
+- **Try it with just a Base wallet — no API key. First 3 bursts on us.**
 
 ---
 
@@ -26,6 +27,8 @@ and pays per call over x402 stablecoin — **charged only if the answer passes.*
 non-verified result costs nothing. No subscription, no human in the loop, spend
 capped per wallet so you can safely let the agent buy on its own.
 
+- **No key to start.** Your first 3 bursts run on the host key — bring only a
+  funded Base wallet. After that, BYOK. Lowest-friction way to try it.
 - **Pay only if verified.** The verifier gates the charge. Risk-free purchase.
 - **Fast.** Best-of-N runs concurrently on Cerebras — a 3-sample burst in ~0.24s.
 - **BYOK.** Bring your own provider key; your tokens, your rate limit. We sell
@@ -49,7 +52,9 @@ pip install verified-burst      # or zero-install: uvx verified-burst
 ```
 
 Fund the wallet with a little USDC on Base. That's it — your agent can now buy
-verified bursts. `BURST_PROVIDER_KEY` is optional (BYOK). Full guide: INSTALL.md.
+verified bursts. **`BURST_PROVIDER_KEY` is optional:** leave it out and your first
+3 bursts run on the host key; after that, drop in your own Cerebras key (BYOK —
+your tokens, your rate limit). Full guide: INSTALL.md.
 
 ---
 
@@ -121,8 +126,9 @@ whether a Show HN catches.
 - **Name:** Verified Burst
 - **Category:** Service / AI inference (x402-gated)
 - **One-line:** Pay-per-correct-answer inference bursts for agents — escalate +
-  best-of-N + verify, settled over x402, charged only if verified. BYOK, MCP one-liner.
-- **Endpoint:** https://solcleus.com/v1/burst (GET /v1/quote for price)
+  best-of-N + verify, settled over x402, charged only if verified. No API key to
+  start (first 3 bursts on the host key), then BYOK. MCP one-liner.
+- **Endpoint:** https://burst.solcleus.com/v1/burst (GET /v1/quote for price)
 - **Networks:** Base mainnet (USDC, scheme `exact`/EIP-3009)
 - **Facilitator:** self-hosted
 - **Client:** MCP server (`mcp_remote.py`) + raw HTTP
