@@ -224,6 +224,38 @@ def _manifest(base=PUBLIC_URL):
     }
 
 
+def _example(base=PUBLIC_URL):
+    """A copy-paste-correct request, attached to 4xx replies so a caller that
+    bounced (bad body / no BYOK) can self-correct instead of giving up. The logs
+    show most failed buy-attempts are malformed or BYOK-less — this turns the wall
+    into a worked example."""
+    body = {"request": "Is 12 * 17 = 204? Answer yes or no.",
+            "strategy": "best_of_n", "n": 3,
+            "verifier": "self_consistency", "answer_key": ["regex", "(yes|no)"]}
+    byok = ("required — your own Cerebras key; your tokens, your rate limit"
+            if REQUIRE_BYOK and TRIAL_CAP == 0
+            else f"optional for your first {TRIAL_CAP} burst(s), then required (BYOK)")
+    return {
+        "easiest": "pip install verified-burst  —  the MCP client signs the x402 payment for you",
+        "request_shape": {
+            "method": "POST", "url": f"{base}/v1/burst",
+            "headers": {
+                "Content-Type": "application/json",
+                "X-PAYMENT": "<x402 payment header: sign the requirements from the 402 challenge "
+                             "(GET /v1/burst or this endpoint with no X-PAYMENT). The MCP client/SDK does this for you>",
+                "X-Provider-Key": f"<{byok}>",
+            },
+            "body": body,
+        },
+        "curl": (f"curl -sS -X POST {base}/v1/burst "
+                 f"-H 'Content-Type: application/json' "
+                 f"-H 'X-Provider-Key: <your-cerebras-key>' "
+                 f"-d '{json.dumps(body)}'   # then add the X-PAYMENT header from the 402 challenge"),
+        "docs": f"{base}/v1/info",
+        "human_url": f"{base}/burst",
+    }
+
+
 def _key(d, *names, default=None):
     for n in names:
         if n in d:
@@ -286,19 +318,24 @@ class Handler(BaseHTTPRequestHandler):
         if not _rate_ok(self._client_ip()):
             return self._send(429, {"error": "rate_limited", "retry_after_s": 60},
                               {"Retry-After": "60"})
+        base = _base_url_for(self.headers.get("Host"))
+        ex = _example(base)  # worked example attached to every 4xx so bouncers self-correct
         try:
             n = int(self.headers.get("Content-Length", 0))
         except ValueError:
-            return self._send(400, {"error": "bad_length"})
+            return self._send(400, {"error": "bad_length", "example": ex})
         if n > MAX_BODY:
             return self._send(413, {"error": "request_too_large", "max_bytes": MAX_BODY})
         try:
             req = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
-            return self._send(400, {"error": "bad_json"})
+            return self._send(400, {"error": "bad_json",
+                                    "detail": "body must be JSON", "example": ex})
 
         if not req.get("request"):
-            return self._send(400, {"error": "missing 'request'"})
+            return self._send(400, {"error": "missing 'request'",
+                                    "detail": "include a 'request' field with the decision to resolve",
+                                    "example": ex})
         if len(str(req["request"])) > MAX_REQ_CHARS:
             return self._send(413, {"error": "request_too_long", "max_chars": MAX_REQ_CHARS})
 
@@ -330,7 +367,7 @@ class Handler(BaseHTTPRequestHandler):
         if result["status"] == "byok_required":
             return self._send(400, {"error": "byok_required", "hint": result.get("hint"),
                                     "trial_used": result.get("trial_used"),
-                                    "trial_cap": result.get("trial_cap")})
+                                    "trial_cap": result.get("trial_cap"), "example": ex})
         if result["status"] == "budget_exceeded":
             return self._send(402, result)
         # not_verified -> 200 with charged:false (honest: no charge); ok -> 200 charged:true
