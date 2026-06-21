@@ -36,6 +36,13 @@ REQUIRE_BYOK = os.environ.get("BURST_REQUIRE_BYOK", "0").lower() in ("1", "true"
 # Free-trial: a wallet with no BYOK key gets this many bursts on the HOST key (still
 # paid per burst), then must bring its own key. 0 = strict BYOK (no trial).
 TRIAL_CAP = int(os.environ.get("BURST_TRIAL_BURSTS", "0"))
+# Advertise the independent-judge verifier on the PUBLIC discovery surface (the
+# x402scan-indexed 402 + manifest): adds it to the verifier enum and attaches the
+# machine-readable ROI block. OFF by default so deploying the capability does NOT
+# change the crawler-visible listing — flip to "1" (one env change, no code redeploy)
+# when we make independence the headline. The endpoint ACCEPTS verifier=independent_judge
+# regardless; this flag only controls discovery copy.
+ADVERTISE_INDEPENDENT = os.environ.get("ADVERTISE_INDEPENDENT", "0").lower() in ("1", "true", "yes")
 
 _HITS = defaultdict(deque)
 _HITS_LOCK = threading.Lock()
@@ -139,11 +146,17 @@ _INPUT_SCHEMA = {
                     "when the answer is checkable — a label, number, JSON field, or yes/no."},
         "strategy": {"type": "string", "enum": ["fast", "best_of_n"], "default": "best_of_n"},
         "n": {"type": "integer", "default": 3},
-        "verifier": {"type": "string", "enum": ["self_consistency", "judge", "none"],
+        "verifier": {"type": "string",
+                     "enum": (["self_consistency", "judge", "independent_judge", "none"]
+                              if ADVERTISE_INDEPENDENT else
+                              ["self_consistency", "judge", "none"]),
                      "default": "self_consistency",
-                     "description": "How the answer is checked before you're charged: "
+                     "description": ("How the answer is checked before you're charged: "
                      "self_consistency = N-of-M samples agree (pair with answer_key); "
-                     "judge = adversarial LLM check; none = no gate (always charged)."},
+                     "judge = adversarial LLM check; none = no gate (always charged)."
+                     + (" independent_judge = a DIFFERENT model family checks the answer "
+                        "(decorrelated from your model's blind spots — the one check you can't "
+                        "self-supply); charged only if it passes." if ADVERTISE_INDEPENDENT else ""))},
         "answer_key": {"type": "array", "items": {"type": "string"},
                        "description": 'How to extract the comparable answer for self_consistency '
                        '— ["json","<field>"] or ["regex","(<pat>)"]. Recommended: without it, '
@@ -219,9 +232,29 @@ def _bazaar_ext():
     }
 
 
+def _roi_block(q):
+    """Machine-readable ROI so an agent's budget policy can auto-approve the buy on
+    its OWN authority — no human in the loop. The economics are the whole pitch:
+    bounded, tiny cost; ZERO downside (you pay only if an INDEPENDENT check passes);
+    and the check is the one form of 'more thinking' the agent can't generate from
+    its own correlated samples. Stakes-class tells the policy WHEN it's worth it."""
+    return {
+        "unit": "one independently-verified decision",
+        "cost_usd": q["price_usd"],
+        "downside_usd": 0.0,
+        "pay_only_if_verified": True,
+        "independence": {"verifier": "different model family than your generator",
+                         "why": "errors decorrelated from your model's blind spots"},
+        "keepable_receipt": True,
+        "worth_it_when": ("decision is hard / irreversible / low-confidence AND has a checkable "
+                          "answer (label, number, JSON field, yes/no)"),
+        "auto_approve_hint": "downside is bounded to 0 — safe to buy without human review",
+    }
+
+
 def _discovery_402(q, base=PUBLIC_URL):
     """Full canonical x402 v2 Payment-Required body for the GET discovery surface."""
-    return {
+    body = {
         "x402Version": 2,
         "error": "payment_required",
         "resource": _resource_info(base),
@@ -236,6 +269,9 @@ def _discovery_402(q, base=PUBLIC_URL):
         "demo_url": (f"{base}/v1/burst/demo" if DEMO_ENABLED else None),  # try free, no wallet
         "human_url": f"{base}/burst",
     }
+    if ADVERTISE_INDEPENDENT:
+        body["roi"] = _roi_block(q)
+    return body
 
 
 def _manifest(base=PUBLIC_URL):
@@ -331,15 +367,50 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
 
+    # Permissive CORS: discovery + paid endpoints are meant to be hit cross-origin
+    # by browser/JS agents. Abuse is gated by payment, not Origin, so `*` is safe;
+    # we expose X-PAYMENT-RESPONSE so a browser caller can read the settle receipt.
+    _CORS = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, X-PAYMENT, X-Provider-Key, X-Cerebras-Key",
+        "Access-Control-Expose-Headers": "X-PAYMENT-RESPONSE",
+        "Access-Control-Max-Age": "86400",
+    }
+
     def _send(self, code, obj, extra_headers=None):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for k, v in self._CORS.items():
+            self.send_header(k, v)
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
+        # HEAD: headers (incl. Content-Length) are sent, body is suppressed — so a
+        # crawler that probes with HEAD gets a real 200/402, not a 501 dead-end.
+        if getattr(self, "_is_head", False):
+            return
         self.wfile.write(body)
+
+    def do_HEAD(self):
+        # Reuse the GET routing so HEAD reflects the same status/headers, sans body.
+        self._is_head = True
+        try:
+            self.do_GET()
+        finally:
+            self._is_head = False
+
+    def do_OPTIONS(self):
+        # CORS preflight: browser/JS agents sending the custom X-PAYMENT /
+        # X-Provider-Key headers preflight first. 204 + the CORS allow-set lets the
+        # real request through instead of bouncing on a 501.
+        self.send_response(204)
+        for k, v in self._CORS.items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -476,21 +547,40 @@ class Handler(BaseHTTPRequestHandler):
         provider_key = self.headers.get("X-Provider-Key") or self.headers.get("X-Cerebras-Key")
 
         ak = req.get("answer_key")
-        result = broker.serve_burst(
-            req["request"],
-            x_payment=self.headers.get("X-PAYMENT"),
-            strategy=req.get("strategy", "best_of_n"),
-            n=int(req.get("n", 3)),
-            verifier=req.get("verifier", "self_consistency"),
-            answer_key=tuple(ak) if isinstance(ak, list) else None,
-            provider_key=provider_key,
-            model=req.get("model"),
-            require_byok=REQUIRE_BYOK,
-            trial_cap=TRIAL_CAP,
-        )
+        qk = req.get("quorum_k")
+        try:
+            n = max(1, min(int(req.get("n", 3)), 8))   # clamp best-of-N / thread fan-out
+        except (TypeError, ValueError):
+            n = 3
+        try:
+            qk = max(1, int(qk)) if qk is not None else None  # never < 1 (quorum integrity)
+        except (TypeError, ValueError):
+            qk = None
+        try:
+            result = broker.serve_burst(
+                req["request"],
+                x_payment=self.headers.get("X-PAYMENT"),
+                strategy=req.get("strategy", "best_of_n"),
+                n=n,
+                verifier=req.get("verifier", "self_consistency"),
+                answer_key=tuple(ak) if isinstance(ak, list) else None,
+                provider_key=provider_key,
+                model=req.get("model"),
+                require_byok=REQUIRE_BYOK,
+                trial_cap=TRIAL_CAP,
+                candidate=req.get("candidate"),        # judge a supplied answer (no generation)
+                quorum_k=qk,
+            )
+        except Exception as e:
+            # never settles (settle only runs on res.passed); fail closed, no stack leak
+            return self._send(500, {"error": "internal_error", "detail": type(e).__name__})
 
         if result["status"] == "payment_required":
-            return self._send(402, {"x402Version": 1, "accepts": result["accepts"],
+            # Envelope version MUST match the SDK-built v2 accepts (x402==2 stamps
+            # "x402Version": 2 everywhere); a stale `1` here told v2 clients the
+            # body was v1 while the accepts were v2 — an inconsistency a strict
+            # client rejects, so a well-formed buyer never crosses 402 -> pay.
+            return self._send(402, {"x402Version": 2, "accepts": result["accepts"],
                                     "quote": result["quote"], "error": "payment_required"})
         if result["status"] == "byok_required":
             return self._send(400, {"error": "byok_required", "hint": result.get("hint"),
@@ -498,6 +588,10 @@ class Handler(BaseHTTPRequestHandler):
                                     "trial_cap": result.get("trial_cap"), "example": ex})
         if result["status"] == "budget_exceeded":
             return self._send(402, result)
+        if result["status"] == "verifier_locked":
+            # unproven wallet burned too many broker-paid judge calls without paying
+            return self._send(429, {"error": "verifier_locked", "hint": result.get("hint"),
+                                    "misses": result.get("misses"), "example": ex})
         # not_verified -> 200 with charged:false (honest: no charge); ok -> 200 charged:true
         hdrs = {"X-PAYMENT-RESPONSE": result["tx"]} if result.get("tx") else None
         return self._send(200, result, hdrs)
@@ -526,7 +620,7 @@ class Handler(BaseHTTPRequestHandler):
         result = bestprice.serve_search(query, x_payment=self.headers.get("X-PAYMENT"))
 
         if result["status"] == "payment_required":
-            return self._send(402, {"x402Version": 1, "accepts": result["accepts"],
+            return self._send(402, {"x402Version": 2, "accepts": result["accepts"],
                                     "quote": result["quote"], "error": "payment_required"})
         if result["status"] == "budget_exceeded":
             return self._send(402, result)
@@ -538,6 +632,13 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(os.environ.get("PORT", "8402"))
     mode = os.environ.get("X402_MODE", "sim")
+    # Money-safety boot check: in SIM mode the facilitator does NOT move real funds and
+    # trusts a client-supplied `from` as the payer. That must never face the public
+    # internet. Refuse to bind a non-loopback host in sim unless explicitly forced.
+    if mode.lower() != "live" and BIND_HOST not in ("127.0.0.1", "localhost", "::1") \
+            and os.environ.get("ALLOW_PUBLIC_SIM") != "1":
+        raise SystemExit("refusing to serve SIM mode on a public interface "
+                         "(set X402_MODE=live, or ALLOW_PUBLIC_SIM=1 to override for testing)")
     print(f"verified-burst broker on {BIND_HOST}:{port}  "
           f"(x402={mode}, rate={RATE_PER_MIN}/min/ip, model={pricing.quote()['model']})")
     ThreadingHTTPServer((BIND_HOST, port), Handler).serve_forever()

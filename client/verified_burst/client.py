@@ -102,6 +102,10 @@ def buy(args):
         body["answer_key"] = args["answer_key"]
     if args.get("model"):
         body["model"] = args["model"]
+    if args.get("candidate") is not None:        # judge a supplied answer (no generation)
+        body["candidate"] = args["candidate"]
+    if args.get("quorum_k") is not None:         # k of a k-of-M independent quorum
+        body["quorum_k"] = args["quorum_k"]
     extra = {"X-Provider-Key": provider_key} if provider_key else None
     return _pay_flow(ENDPOINT, body, extra)
 

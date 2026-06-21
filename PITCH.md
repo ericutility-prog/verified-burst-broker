@@ -132,6 +132,44 @@ whether a Show HN catches.
 
 ---
 
+## Farcaster (x402 / Base community — primary social shot)
+
+The x402/Base builder crowd lives on Farcaster, not Twitter. Post as a thread
+(reply-chain). Keep casts tight (~300 chars each is safe). Channels to post in /
+cross-post: **/base**, **/agents**, **/x402** (if live), **/ai**. Reply fast to
+the first comments — same as Show HN, the early replies decide reach.
+
+**Cast 1 — hook + zero-friction demo**
+> Agents run one cheap model and hope. At the calls that matter — irreversible, ambiguous, deadline — they should buy more thinking, and pay only if it's right.
+>
+> Verified Burst: best-of-N + a verifier over x402, charged only when the answer passes. A miss is free.
+>
+> Try it, no wallet → https://burst.solcleus.com
+
+**Cast 2 — the gate (the actual differentiator)**
+> The point isn't billing, it's the gate. Every response is proceed / hold:
+> • samples agree → proceed
+> • they don't → hold: don't act, escalate
+>
+> It's a circuit breaker for an agent's irreversible moves — verify before it spends, migrates, or commits a value.
+
+**Cast 3 — trust + honest CTA**
+> Live on Base mainnet. Self-hosted facilitator (nobody holds your funds), BYOK, hard per-wallet spend cap.
+>
+> One line: `pip install verified-burst`
+>
+> No outside users yet — looking for first builders. Tell me it's the wrong abstraction.
+> Proof tx: https://basescan.org/tx/0x76921c33f6c83e78757b8218c101ac362ab19ba994ded6743b9bbb2defd359c4
+
+**X / Twitter (single-post condensation, if you cross-post):**
+> Your agent runs cheap by default. At the irreversible call, it should buy more thinking — and pay only if it's right.
+>
+> Verified Burst: best-of-N + verifier over x402, charged only when the answer passes (a miss is free). proceed/hold gate, BYOK, live on Base.
+>
+> Try it, no wallet: https://burst.solcleus.com
+
+---
+
 ## x402 ecosystem directory entry
 
 - **Name:** Verified Burst
@@ -228,3 +266,6 @@ vaporware/astroturf suspicion. Post to one venue at a time; reply fast in the fi
 
 **"Letting agents spend money autonomously is a security nightmare."**
 > That's basically the thesis for why the guardrails are the product, not the inference. Hard per-wallet spend cap enforced on-chain (can't exceed what you fund), pay-only-if-it-passes, and a gate that returns *hold* so the agent stops instead of acting on a bad answer. It's meant to be the circuit breaker, not the thing that yolos a transaction.
+
+**"Prompt injection — if the input is attacker-controlled, can't it make all N samples agree on the wrong answer?"** *(sharp; concede the limit fully)*
+> Yes, and this is the most important limitation to be clear about. Self-consistency catches the model *wavering* (uncertainty) — not an input engineered to make it confidently wrong. If the request itself is poisoned, N agreeing samples can agree on the attacker's answer and the gate would say `proceed`. So this is **not** an injection defense, and I shouldn't let anyone read it as one. Honest mitigations: for adversarial-input cases use the `judge` verifier (an independent adversarial check) rather than self-consistency; and the on-chain spend cap + settle receipt remain the backstop, so a bad `proceed` is bounded and auditable rather than unbounded. If your threat model is a poisoned prompt, you need input provenance upstream of this — the gate is for model uncertainty, not malicious inputs.
