@@ -1,3 +1,5 @@
+# Independent voices, each judging the same subject, resolving only on consensus.
+# (A fugue, more or less.) — the quorum tier.
 """verified_burst.guard — route every agent decision through a governance policy.
 
 The whole idea in one sentence: a decision passes through ONE policy that picks a
