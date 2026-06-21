@@ -147,7 +147,8 @@ _INPUT_SCHEMA = {
         "strategy": {"type": "string", "enum": ["fast", "best_of_n"], "default": "best_of_n"},
         "n": {"type": "integer", "default": 3},
         "verifier": {"type": "string",
-                     "enum": (["self_consistency", "judge", "independent_judge", "none"]
+                     "enum": (["self_consistency", "judge", "independent_judge",
+                               "independent_quorum", "none"]
                               if ADVERTISE_INDEPENDENT else
                               ["self_consistency", "judge", "none"]),
                      "default": "self_consistency",
@@ -156,7 +157,10 @@ _INPUT_SCHEMA = {
                      "judge = adversarial LLM check; none = no gate (always charged)."
                      + (" independent_judge = a DIFFERENT model family checks the answer "
                         "(decorrelated from your model's blind spots — the one check you can't "
-                        "self-supply); charged only if it passes." if ADVERTISE_INDEPENDENT else ""))},
+                        "self-supply). independent_quorum = several independent models ACROSS "
+                        "VENDORS must agree (k-of-M; pass quorum_k). Both charged only if they "
+                        "pass; pass a 'candidate' to verify your agent's OWN answer (no generation)."
+                        if ADVERTISE_INDEPENDENT else ""))},
         "answer_key": {"type": "array", "items": {"type": "string"},
                        "description": 'How to extract the comparable answer for self_consistency '
                        '— ["json","<field>"] or ["regex","(<pat>)"]. Recommended: without it, '
@@ -243,8 +247,10 @@ def _roi_block(q):
         "cost_usd": q["price_usd"],
         "downside_usd": 0.0,
         "pay_only_if_verified": True,
-        "independence": {"verifier": "different model family than your generator",
-                         "why": "errors decorrelated from your model's blind spots"},
+        "independence": {"verifier": "a different model family than your generator",
+                         "quorum": "independent_quorum runs several models ACROSS VENDORS; k-of-M must agree",
+                         "why": "errors decorrelated from your model's blind spots — the one check "
+                                "you can't generate from your own correlated samples"},
         "keepable_receipt": True,
         "worth_it_when": ("decision is hard / irreversible / low-confidence AND has a checkable "
                           "answer (label, number, JSON field, yes/no)"),

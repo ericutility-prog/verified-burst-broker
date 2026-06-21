@@ -28,6 +28,18 @@ CEREBRAS = {
     "price_verified": True,
 }
 
+# A CROSS-PROVIDER judge tier (different vendor + weights than Cerebras) for genuine
+# independence. OpenAI-compatible, so the same `chat()` path works — just a different
+# base_url/key. Only used for the broker-paid judge (never for buyer generation), and
+# only active when OPENROUTER_API_KEY + OPENROUTER_JUDGE_MODEL are set.
+OPENROUTER = {
+    "base_url": "https://openrouter.ai/api/v1",
+    "key_env": "OPENROUTER_API_KEY",
+    "model": os.environ.get("OPENROUTER_JUDGE_MODEL", ""),
+    "price_in": 0.0, "price_out": 0.0, "price_verified": False,  # judge cost is ours, varies by model
+    "headers": {"HTTP-Referer": "https://solcleus.com", "X-Title": "Verified Burst"},
+}
+
 
 def chat(messages, *, tier=CEREBRAS, temperature=0.0, max_tokens=256, timeout=60,
          api_key=None, model=None):
@@ -51,7 +63,8 @@ def chat(messages, *, tier=CEREBRAS, temperature=0.0, max_tokens=256, timeout=60
         tier["base_url"].rstrip("/") + "/chat/completions",
         data=body,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                 "User-Agent": "Mozilla/5.0 (burst-broker)"},  # urllib UA trips Cloudflare 1010
+                 "User-Agent": "Mozilla/5.0 (burst-broker)",  # urllib UA trips Cloudflare 1010
+                 **tier.get("headers", {})},                   # per-tier extras (OpenRouter attribution)
     )
     # Retry transient rate-limit/overload with exponential backoff + jitter so a
     # single 429 never sinks a burst. Honors Retry-After when the server sends it.

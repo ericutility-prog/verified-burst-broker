@@ -31,36 +31,51 @@ JUDGE_MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "1024"))
 JUDGE_FAMILIES = [m.strip() for m in
                   os.environ.get("JUDGE_FAMILIES", f"{VERIFIER_MODEL},{VERIFIER_ALT}").split(",")
                   if m.strip()]
+# Cross-PROVIDER judge (different vendor + weights, via OpenRouter). Active ONLY when
+# both the key and a model are set; otherwise the pool is the Cerebras families and
+# behaviour is unchanged. This is what makes "independent" defensible with no asterisk
+# and deepens the quorum past 2-of-2.
+OPENROUTER_JUDGE_MODEL = os.environ.get("OPENROUTER_JUDGE_MODEL", "").strip()
 
 
-def _bind_judge(vmodel):
-    """A judge call bound to OUR key + ONE family, with reasoning headroom. api_key=None
-    -> falls back to our env CEREBRAS_API_KEY (never the buyer's)."""
+def _judge_pool():
+    """All configured judges as (provider, model). Cerebras families always; the
+    OpenRouter cross-provider judge appended when its key + model are present."""
+    pool = [("cerebras", m) for m in JUDGE_FAMILIES]
+    if OPENROUTER_JUDGE_MODEL and os.environ.get("OPENROUTER_API_KEY"):
+        pool.append(("openrouter", OPENROUTER_JUDGE_MODEL))
+    return pool
+
+
+def _bind_judge(pname, vmodel):
+    """A judge call bound to OUR key + ONE (provider, model), with reasoning headroom.
+    api_key=None -> falls back to our env key for that provider (never the buyer's)."""
+    tier = provider.OPENROUTER if pname == "openrouter" else provider.CEREBRAS
     def verify_fn(msgs, temperature=0.0):
-        return provider.chat(msgs, temperature=temperature, api_key=None,
+        return provider.chat(msgs, tier=tier, temperature=temperature, api_key=None,
                              model=vmodel, max_tokens=JUDGE_MAX_TOKENS)
     return verify_fn
 
 
 def _judge_families(generator_model):
-    """The judge families that DIFFER from the generator (the basis of real
-    independence). Always returns at least one, even if the generator is in the pool."""
+    """The judges whose MODEL differs from the generator (the basis of real
+    independence). Returns [(provider, model), ...]; always at least one."""
     gen = generator_model or provider.CEREBRAS["model"]
-    fams = [m for m in JUDGE_FAMILIES if m != gen]
-    return fams or [VERIFIER_ALT if gen != VERIFIER_ALT else VERIFIER_MODEL]
+    fams = [(p, m) for (p, m) in _judge_pool() if m != gen]
+    return fams or [("cerebras", VERIFIER_ALT if gen != VERIFIER_ALT else VERIFIER_MODEL)]
 
 
 def _independent_verify_fn(generator_model):
     """Single independent judge — the 'auto' tier (verifier=independent_judge).
     Returns (verify_fn, verifier_model)."""
-    vmodel = _judge_families(generator_model)[0]
-    return _bind_judge(vmodel), vmodel
+    pname, vmodel = _judge_families(generator_model)[0]
+    return _bind_judge(pname, vmodel), vmodel
 
 
 def _independent_verify_fns(generator_model):
-    """ALL distinct independent judge families — the quorum tier
-    (verifier=independent_quorum). Returns [(verify_fn, verifier_model), ...]."""
-    return [(_bind_judge(vm), vm) for vm in _judge_families(generator_model)]
+    """ALL distinct independent judges — the quorum tier (verifier=independent_quorum).
+    Returns [(verify_fn, verifier_model), ...]."""
+    return [(_bind_judge(p, vm), vm) for (p, vm) in _judge_families(generator_model)]
 
 
 # Per-payer spend ledger (in-memory; swap for the AgentsPrice margin governor in prod).
