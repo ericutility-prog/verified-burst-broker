@@ -157,7 +157,7 @@ _INPUT_SCHEMA = {
                      "judge = adversarial LLM check; none = no gate (always charged)."
                      + (" independent_judge = a DIFFERENT model family checks the answer "
                         "(decorrelated from your model's blind spots — the one check you can't "
-                        "self-supply). independent_quorum = several independent models ACROSS "
+                        "self-supply). independent_quorum = multiple independent models ACROSS "
                         "VENDORS must agree (k-of-M; pass quorum_k). Both charged only if they "
                         "pass; pass a 'candidate' to verify your agent's OWN answer (no generation)."
                         if ADVERTISE_INDEPENDENT else ""))},
@@ -248,7 +248,7 @@ def _roi_block(q):
         "downside_usd": 0.0,
         "pay_only_if_verified": True,
         "independence": {"verifier": "a different model family than your generator",
-                         "quorum": "independent_quorum runs several models ACROSS VENDORS; k-of-M must agree",
+                         "quorum": "independent_quorum runs multiple models ACROSS VENDORS; k-of-M must agree",
                          "why": "errors decorrelated from your model's blind spots — the one check "
                                 "you can't generate from your own correlated samples"},
         "keepable_receipt": True,
