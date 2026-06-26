@@ -9,6 +9,7 @@
 
 Stdlib only. Run: python3 server.py  (PORT env, default 8402).
 """
+import base64
 import json
 import os
 import threading
@@ -391,6 +392,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         for k, v in self._CORS.items():
             self.send_header(k, v)
+        # x402 challenge ALSO advertised in headers, not just the v2 body. Header-
+        # based indexers/agents (402 Index, header-sniffing crawlers, HEAD probes)
+        # detect via WWW-Authenticate + PAYMENT-REQUIRED; body-reading clients
+        # (x402scan, our own SDK) are unaffected. Only emitted for the payment-
+        # required challenge (a 402 carrying `accepts`), never other responses.
+        if code == 402 and isinstance(obj, dict) and obj.get("accepts"):
+            self.send_header("WWW-Authenticate", "x402")
+            try:
+                # Carry the FULL challenge object (x402Version + accepts), the shape
+                # header-parsing indexers validate against — not just the bare array.
+                challenge = {"x402Version": obj.get("x402Version", 2),
+                             "accepts": obj["accepts"]}
+                pr = base64.b64encode(json.dumps(challenge).encode()).decode()
+                self.send_header("PAYMENT-REQUIRED", pr)
+            except Exception:
+                pass
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
