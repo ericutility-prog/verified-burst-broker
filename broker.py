@@ -12,6 +12,20 @@ import provider
 import burst as burst_mod
 from x402_gate import Facilitator, build_requirements
 
+# ───────────────────────────────────────────────────────────────────────────
+# ROADMAP — where the next expansions plug in. `grep -rn ">>> EXTENSION POINT"`
+# to jump to each seam. Each is isolated so it can grow without touching the
+# money path:
+#   • ledger.py    — swap sqlite -> Postgres/Redis for multi-process / multi-host scale
+#   • broker.py /  — add vendors to the judge pool for cross-PROVIDER independence
+#     provider.py    (deepens independent_quorum past same-vendor weights)
+#   • burst.py     — new verifier strategies; full ReDoS isolation
+#   • flagstore.py — cross-agent SYNC of the verified-flag commons (the "hive")
+#   • clearance.py — on-chain settle_tx verification; publish the cert as an open spec
+#   • pricing.py   — dynamic / margin-governed pricing
+#   • server.py    — new x402-gated resources; observability / metrics
+# ───────────────────────────────────────────────────────────────────────────
+
 # The two model families on our account. Independence = judging on a DIFFERENT family
 # than generated the answer, so the check's errors are decorrelated from the answer's.
 # Same inference vendor (Cerebras), different weights (OpenAI OSS vs Zhipu GLM) — good
@@ -31,6 +45,10 @@ JUDGE_MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "1024"))
 JUDGE_FAMILIES = [m.strip() for m in
                   os.environ.get("JUDGE_FAMILIES", f"{VERIFIER_MODEL},{VERIFIER_ALT}").split(",")
                   if m.strip()]
+# >>> EXTENSION POINT (independence depth): widen the judge pool across VENDORS here —
+# add (provider, model) entries so independent_quorum spans different vendors, not just
+# different weights on one vendor. The stronger the cross-vendor quorum, the stronger
+# the "independent" claim (and the clearance tier built on it).
 # Cross-PROVIDER judge (different vendor + weights, via OpenRouter). Active ONLY when
 # both the key and a model are set; otherwise the pool is the Cerebras families and
 # behaviour is unchanged. This is what makes "independent" defensible with no asterisk
@@ -78,60 +96,30 @@ def _independent_verify_fns(generator_model):
     return [(_bind_judge(p, vm), vm) for (p, vm) in _judge_families(generator_model)]
 
 
-# Per-payer spend ledger (in-memory; swap for the AgentsPrice margin governor in prod).
-_SPENT = {}
-# Per-payer count of free-trial bursts run on the HOST provider key (no BYOK).
-# In-memory: resets on restart. The trial still requires a valid x402 payment, so
-# each free burst proves a funded wallet and (when verified) is paid for — the cap
-# just bounds host-token use per wallet before BYOK is required.
-_TRIAL = {}
-DEFAULT_BUDGET_USD = 1.00  # per-agent cap; mirror AgentsPrice's governor
+# Per-payer spend, holds, free-trial counts and abuse breakers live in a DURABLE
+# sqlite ledger (see ledger.py): they survive restarts and stay correct under
+# concurrency (each read-modify-write is one transaction under a lock). This is what
+# turns the spend governor + Sybil breakers from best-effort-in-RAM into real.
+import ledger
 
-# Anti-abuse for the ONE verifier that spends OUR tokens (independent_judge). The judge
-# runs BEFORE the pay/no-pay decision and a miss yields no revenue, so a non-paying
-# wallet could spam guaranteed-fail bursts to burn our judge tokens. Defense, scoped
-# to independent_judge only (the BYOK verifiers cost us nothing, so they're untouched):
-#   Rule 1 = independent_judge requires BYOK (never host-key) -> we never eat the
-#            buyer's generation, only the ~$0.0004 judge call.
-#   Rule 2 = an UNPROVEN wallet (never settled a payment) is cut off after a short
-#            streak of misses; a PROVEN payer (has settled >=1) is never locked.
-# An attacker never settles (always misses) -> never becomes proven -> capped at
-# IJ_MISS_LIMIT free judge-misses per wallet, then must fund+rotate (Sybil cost).
-_IJ_MISSES = {}                  # per-payer CONSECUTIVE independent_judge misses
+DEFAULT_BUDGET_USD = float(os.environ.get("BURST_BUDGET_USD", "1.00"))  # per-agent cap
+
+# Anti-abuse for the broker-paid judges (independent_judge/quorum — the only paths that
+# spend OUR tokens). A miss yields no revenue, so without these a non-paying wallet could
+# spam guaranteed-fail bursts to burn judge tokens. All three breakers are now DURABLE
+# (ledger-backed), so a restart can't reset an attacker's streak:
+#   Rule 1 = independent_judge requires BYOK (never host-key) -> a miss costs us at most
+#            the ~$0.0004 judge call, never the buyer's generation.
+#   Rule 2 = an UNPROVEN wallet (never settled) is cut off after IJ_MISS_LIMIT
+#            consecutive misses; a PROVEN payer (settled >=1) is never locked.
+#   Rule 3 = a GLOBAL daily ceiling on judge calls from unproven wallets, so Sybil
+#            wallet-rotation can't defeat the per-wallet breaker.
 IJ_MISS_LIMIT = int(os.environ.get("IJ_MISS_LIMIT", "3"))
-
-# GLOBAL daily ceiling on broker-paid judge calls from UNPROVEN wallets. The per-wallet
-# miss-breaker alone can't stop Sybil rotation (fund a fresh wallet, get 3 more free
-# misses); this caps the AGGREGATE host-key judge burn across all unproven wallets per
-# UTC-day. Proven payers (settled >=1) bypass it. In-memory: resets on restart + day
-# rollover — bounds steady-state burn; a durable store (sqlite) is the follow-up for H2.
-import time as _time
 IJ_GLOBAL_DAILY = int(os.environ.get("IJ_GLOBAL_DAILY", "2000"))   # judge calls/day, unproven
-_IJ_GLOBAL = {"day": None, "used": 0}
-
-
-def _is_proven_payer(payer):
-    """A wallet that has settled >=1 payment has shown it pays on a pass — exempt it
-    from the breakers. Reuses the spend ledger (settlement increments _SPENT)."""
-    return _SPENT.get(payer, 0.0) > 0.0
-
-
-def _global_judge_budget_ok(judges, proven):
-    """Reserve `judges` judge calls against today's global pool. Proven payers bypass.
-    Returns False once the day's pool is exhausted (caps Sybil-rotation token burn)."""
-    if proven:
-        return True
-    day = int(_time.time() // 86400)
-    if _IJ_GLOBAL["day"] != day:
-        _IJ_GLOBAL["day"], _IJ_GLOBAL["used"] = day, 0
-    if _IJ_GLOBAL["used"] + judges > IJ_GLOBAL_DAILY:
-        return False
-    _IJ_GLOBAL["used"] += judges
-    return True
 
 
 def trial_used(payer):
-    return _TRIAL.get(payer, 0)
+    return ledger.trial_count(payer)
 
 
 def _gate(quote):
@@ -150,7 +138,8 @@ def _gate(quote):
 
 
 def remaining_budget(payer, cap=DEFAULT_BUDGET_USD):
-    return max(0.0, cap - _SPENT.get(payer, 0.0))
+    """Spendable budget = cap minus settled spend AND outstanding holds (durable)."""
+    return ledger.remaining(payer, cap)
 
 
 def _gate_signal(res):
@@ -243,7 +232,7 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     #    was already validated above, so trial bursts still prove a funded wallet.
     is_trial = False
     if not provider_key and require_byok:
-        used = _TRIAL.get(payer, 0)
+        used = ledger.trial_count(payer)
         if trial_cap and used < trial_cap:
             is_trial = True   # runs on the host env key; the slot is consumed after the burst
         else:
@@ -269,22 +258,25 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
                     "verifier": verifier}
         # Rule 2: an UNPROVEN wallet that keeps missing is burning our judge tokens for
         # free — cut it off. A proven payer (settled >=1) is never locked.
-        proven = _is_proven_payer(payer)
-        if not proven and _IJ_MISSES.get(payer, 0) >= IJ_MISS_LIMIT:
+        proven = ledger.is_proven(payer)
+        if not proven and ledger.miss_count(payer) >= IJ_MISS_LIMIT:
             return {"status": "verifier_locked", "payer": payer,
-                    "verifier": verifier, "misses": _IJ_MISSES.get(payer, 0),
+                    "verifier": verifier, "misses": ledger.miss_count(payer),
                     "hint": ("too many unverified independent bursts on an unproven "
                              "wallet. Use verifier=self_consistency (free to us, BYOK), or "
                              "settle one passing burst to unlock broker-paid independence.")}
         # Rule 3 (global): cap aggregate host-key judge burn from unproven wallets/day,
-        # so wallet rotation can't defeat the per-wallet breaker.
-        if not _global_judge_budget_ok(judges, proven):
+        # so wallet rotation can't defeat the per-wallet breaker. Proven payers bypass.
+        if not proven and not ledger.global_judge_reserve(judges, IJ_GLOBAL_DAILY):
             return {"status": "verifier_locked", "payer": payer, "verifier": verifier,
                     "hint": ("daily independent-verification budget for unproven wallets is "
                              "spent. Settle a passing burst to unlock, or retry tomorrow.")}
 
-    # 3) governor: refuse if this burst would blow the per-agent cap
-    if q["price_usd"] > remaining_budget(payer, budget_cap):
+    # 3) governor: HOLD the fee up front (atomic check-and-reserve). Reserving before the
+    #    burst — and counting holds against the cap — closes the gap where two concurrent
+    #    bursts from one wallet both clear the check before either settles. The hold is
+    #    released on a miss/failure and converted to spend only on a settled pass.
+    if not ledger.reserve(payer, q["price_usd"], budget_cap):
         return {"status": "budget_exceeded", "payer": payer,
                 "remaining_usd": round(remaining_budget(payer, budget_cap), 6),
                 "price_usd": q["price_usd"]}
@@ -293,27 +285,32 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     #    model family on OUR key so the check is genuinely decorrelated from the
     #    buyer's answer (the part an agent can't self-supply). Skip when a test
     #    injects its own call_fn (sim) — there's no real provider to judge on.
-    verify_fn = verifier_model = verify_fns = None
-    if call_fn is None:
-        if verifier == "independent_judge":
-            verify_fn, verifier_model = _independent_verify_fn(model)
-        elif verifier == "independent_quorum":
-            verify_fns = _independent_verify_fns(model)        # M distinct families
-    res = burst_mod.run_burst(request, strategy=strategy, n=n, verifier=verifier,
-                              answer_key=answer_key, check=check,
-                              receipt_id=receipt_id, call_fn=call_fn,
-                              provider_key=provider_key, model=model,
-                              verify_fn=verify_fn, verifier_model=verifier_model,
-                              candidate=candidate, verify_fns=verify_fns, quorum_k=quorum_k)
+    try:
+        verify_fn = verifier_model = verify_fns = None
+        if call_fn is None:
+            if verifier == "independent_judge":
+                verify_fn, verifier_model = _independent_verify_fn(model)
+            elif verifier == "independent_quorum":
+                verify_fns = _independent_verify_fns(model)        # M distinct families
+        res = burst_mod.run_burst(request, strategy=strategy, n=n, verifier=verifier,
+                                  answer_key=answer_key, check=check,
+                                  receipt_id=receipt_id, call_fn=call_fn,
+                                  provider_key=provider_key, model=model,
+                                  verify_fn=verify_fn, verifier_model=verifier_model,
+                                  candidate=candidate, verify_fns=verify_fns, quorum_k=quorum_k)
+    except Exception:
+        ledger.release(payer, q["price_usd"])   # burst blew up -> nothing charged, free the hold
+        raise
     if is_trial:                       # consume one free-trial slot per completed host-key burst
-        _TRIAL[payer] = _TRIAL.get(payer, 0) + 1
+        ledger.trial_inc(payer)
 
-    trial_remaining = max(0, trial_cap - _TRIAL.get(payer, 0)) if trial_cap else 0
+    trial_remaining = max(0, trial_cap - ledger.trial_count(payer)) if trial_cap else 0
 
     # 5) settle ONLY if the verifier passed — else discard the authorization (no charge)
     if not res.passed:
+        ledger.release(payer, q["price_usd"])   # miss -> free the hold, no charge
         if verifier in ("independent_judge", "independent_quorum"):  # count toward abuse breaker
-            _IJ_MISSES[payer] = _IJ_MISSES.get(payer, 0) + 1
+            ledger.record_miss(payer)
         return {"status": "not_verified", "charged": False, "price_usd": 0.0,
                 "gate": _gate_signal(res),               # action=hold — don't act on this answer
                 "verdict": res.verdict, "answer": res.answer, "payer": payer,
@@ -325,8 +322,10 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
 
     s = fac.settle(x_payment, reqs)
     if s["success"]:
-        _SPENT[payer] = _SPENT.get(payer, 0.0) + q["price_usd"]
-    _IJ_MISSES[payer] = 0                        # a pass clears the abuse streak
+        ledger.commit(payer, q["price_usd"])    # hold -> settled spend
+    else:
+        ledger.release(payer, q["price_usd"])   # settle failed -> no money moved, free the hold
+    ledger.clear_misses(payer)                  # a pass clears the abuse streak
     return {"status": "ok", "charged": bool(s["success"]), "price_usd": q["price_usd"],
             "gate": _gate_signal(res),                   # action=proceed — verified, safe to act
             "tx": s.get("tx"), "mode": s.get("mode"), "verdict": res.verdict,

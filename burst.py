@@ -40,6 +40,10 @@ class BurstResult:
 
 
 # --------------------------- verifiers --------------------------------------- #
+# >>> EXTENSION POINT (verifiers): add a strategy by writing a verify_* fn here and a
+# branch in run_burst's dispatch below. ReDoS note: _extract's regex screen is a
+# heuristic for the common nested-quantifier class — full safety needs the `regex`
+# module's timeout or subprocess isolation (stdlib `re` can't be interrupted in-thread).
 def _extract(text, answer_key):
     """Pull a normalized answer for agreement checks. answer_key:
        None -> whole trimmed text;  ('json', field) -> JSON field;  ('regex', pat) -> group 1."""
@@ -56,6 +60,15 @@ def _extract(text, answer_key):
         # Caller-supplied pattern → bound it: cap length and never let a pathological
         # pattern (ReDoS) crash or wedge the worker. A bad/oversized pattern yields "".
         if not isinstance(spec, str) or len(spec) > 200:
+            return ""
+        # ReDoS screen: reject nested-quantifier patterns — a group containing * or +
+        # that is ITSELF quantified, e.g. (a+)+ / (a*)* / (.*)+ — the classic
+        # catastrophic-backtracking class that can wedge a worker for seconds on a
+        # short input. Legit extractors like (\d+) or (yes|no) have no quantifier
+        # AFTER the group, so they pass. (Heuristic, not a proof — stdlib `re` can't
+        # be interrupted; full coverage needs the `regex` module's timeout. See
+        # security_probe.py frontier.)
+        if re.search(r"\([^)]*[*+][^)]*\)[*+?{]", spec):
             return ""
         try:
             m = re.search(spec, text[:4000])

@@ -9,6 +9,8 @@ cost_basis (token cost) is carried only for transparency/reporting, never billed
 to the buyer in passthrough mode.
 """
 
+# >>> EXTENSION POINT (pricing): FEES is the seam for dynamic / margin-governed pricing
+# (demand- or cost-based). Keep quote() the single source of the up-front, quotable price.
 # All amounts in USD. These are micro-amounts — x402 per-call territory.
 FEES = {
     "base_burst": 0.0020,      # per burst: routing + the guarantee

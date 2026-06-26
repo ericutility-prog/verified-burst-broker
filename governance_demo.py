@@ -11,15 +11,16 @@ how many independent judges must agree (+ whether a human signs off).
 
 Run:  .venv/bin/python governance_demo.py
 """
-import os, sys, json
+import os, sys, json, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "client"))
+os.environ.setdefault("LEDGER_DB", os.path.join(tempfile.gettempdir(), "vb_govdemo.db"))
 import env; env.load_env()
-import broker
+import broker, ledger
 from x402_gate import Facilitator
 from verified_burst.guard import verify, verified, Policy
 
 KEY = os.environ["CEREBRAS_API_KEY"]
-broker._SPENT["0xDemoWallet"] = 0.01     # >0 = proven (breaker exempt); leaves budget headroom
+ledger.commit("0xDemoWallet", 0.01)      # spent>0 = proven (breaker exempt); leaves budget headroom
 BYOK_MODEL = "gpt-4o-mini"               # a non-pool generator label -> BOTH families judge (M=2)
 
 

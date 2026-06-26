@@ -14,9 +14,10 @@ What it shows:
                 judge (live, different family) catches it; action=hold; charged $0.
   3. SAFE     — the anti-abuse rules that let an owner run this unattended.
 """
-import os, json
+import os, json, tempfile
+os.environ.setdefault("LEDGER_DB", os.path.join(tempfile.gettempdir(), "vb_demo.db"))
 import env; env.load_env()
-import broker, burst as burst_mod, pricing
+import broker, burst as burst_mod, pricing, ledger
 from x402_gate import Facilitator
 
 KEY = os.environ.get("CEREBRAS_API_KEY", "")
@@ -107,7 +108,7 @@ def scenario_safe():
                            facilitator=SimFac("0xNoKey"), model=GEN)  # no provider_key
     step("R1", f"independent_judge with no BYOK key -> {r['status']!r}: {r['hint'][:70]}...")
     # Rule 2
-    broker._IJ_MISSES.clear(); broker._SPENT.clear()
+    ledger.reset_all()
     atk = "0xAttacker"
     def miss(msgs, temperature=0.0): return {"text": "no", "usage": {}, "latency_s": 0.0}
     locked_at = None

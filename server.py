@@ -428,9 +428,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, _manifest(base), {"Cache-Control": "public, max-age=300"})
         if u.path == "/v1/quote":
             qs = parse_qs(u.query)
+            try:
+                n = int(qs.get("n", ["3"])[0])
+            except (ValueError, KeyError):
+                n = 3
             return self._send(200, pricing.quote(
-                strategy=qs.get("strategy", ["best_of_n"])[0],
-                n=int(qs.get("n", ["3"])[0])))
+                strategy=qs.get("strategy", ["best_of_n"])[0], n=n))
         if u.path == "/v1/burst":
             # A bare GET on the paid resource: answer with the x402 challenge so a
             # curious agent/dev sees HOW to pay instead of a dead-end 404. No burst
@@ -516,6 +519,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        # >>> EXTENSION POINT (new paid resources): register additional x402-gated POST
+        # endpoints here, with a matching GET discovery 402 in do_GET. Reuse the proven
+        # verify -> fulfill -> settle-IF-earned shape (see _do_best_price / broker.serve_burst).
         if u.path not in ("/v1/burst", "/v1/best-price"):
             return self._send(404, {"error": "not_found"})
         if not _rate_ok(self._client_ip()):

@@ -5,7 +5,11 @@ Rule 1: independent_judge with no BYOK key -> byok_required (we never run the
 Rule 2: an UNPROVEN wallet gets IJ_MISS_LIMIT free misses, then verifier_locked;
         a PROVEN payer (settled >=1) is never locked; a pass clears the streak.
 """
+import os, tempfile
+# Isolate the durable ledger from production — tests must never touch ledger.db.
+os.environ.setdefault("LEDGER_DB", os.path.join(tempfile.gettempdir(), "vb_test_abuse.db"))
 import env; env.load_env()
+import ledger
 import broker
 from x402_gate import Facilitator
 
@@ -27,7 +31,7 @@ def call(payer, **kw):
 
 
 def main():
-    broker._IJ_MISSES.clear(); broker._SPENT.clear()
+    ledger.reset_all()
 
     # Rule 1: no BYOK, no injected call_fn -> byok_required (no model call happens)
     r = call("0xnokey", model="gpt-oss-120b")           # provider_key=None, call_fn=None
@@ -39,13 +43,15 @@ def main():
     for i in range(broker.IJ_MISS_LIMIT):
         r = call(atk, provider_key="byok", call_fn=always_miss)
         assert r["status"] == "not_verified", f"miss {i} -> {r['status']}"
-    print(f"[R2] attacker got {broker.IJ_MISS_LIMIT} free misses (streak={broker._IJ_MISSES[atk]})")
+    print(f"[R2] attacker got {broker.IJ_MISS_LIMIT} free misses (streak={ledger.miss_count(atk)})")
     r = call(atk, provider_key="byok", call_fn=always_miss)
     print(f"[R2] next attempt -> {r['status']}  (want verifier_locked)")
     assert r["status"] == "verifier_locked"
 
     # Proven payer is exempt even with a long miss streak.
-    good = "0xgood"; broker._SPENT[good] = 0.01; broker._IJ_MISSES[good] = 99
+    good = "0xgood"; ledger.commit(good, 0.01)
+    for _ in range(broker.IJ_MISS_LIMIT + 5):
+        ledger.record_miss(good)
     r = call(good, provider_key="byok", call_fn=always_miss)
     print(f"[R2] proven payer w/ 99 misses -> {r['status']}  (want not_verified, NOT locked)")
     assert r["status"] == "not_verified"
@@ -54,10 +60,10 @@ def main():
     def passes(msgs, temperature=0.0):
         return {"text": '{"adequate": true}', "usage": {}, "latency_s": 0.0}
     fresh = "0xfresh"
-    broker._IJ_MISSES[fresh] = 2
+    ledger.record_miss(fresh); ledger.record_miss(fresh)
     r = call(fresh, provider_key="byok", call_fn=passes)
-    print(f"[R2] pass after 2 misses -> status={r['status']} streak_now={broker._IJ_MISSES[fresh]} (want 0)")
-    assert r["status"] == "ok" and broker._IJ_MISSES[fresh] == 0
+    print(f"[R2] pass after 2 misses -> status={r['status']} streak_now={ledger.miss_count(fresh)} (want 0)")
+    assert r["status"] == "ok" and ledger.miss_count(fresh) == 0
 
     # C1 regression: a quorum with k<=0 (or k>M) must NEVER pass with zero agreeing judges.
     import burst as burst_mod

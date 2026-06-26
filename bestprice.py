@@ -17,6 +17,7 @@ import urllib.parse
 
 import pricing
 import broker
+import ledger
 
 AGENTSPRICE_BASE = os.environ.get("AGENTSPRICE_BASE", "https://agentsprice.com").rstrip("/")
 AGENTSPRICE_KEY = os.environ.get("AGENTSPRICE_KEY", "")   # optional: real keyed best-price
@@ -89,7 +90,7 @@ def serve_search(query, *, x_payment=None, budget_cap=broker.DEFAULT_BUDGET_USD,
 
     s = fac.settle(x_payment, reqs)
     if s["success"]:
-        broker._SPENT[payer] = broker._SPENT.get(payer, 0.0) + q["price_usd"]
+        ledger.commit(payer, q["price_usd"])
     return {"status": "ok", "charged": bool(s["success"]), "price_usd": q["price_usd"],
             "tx": s.get("tx"), "mode": s.get("mode"),
             "query": query, "result": result, "count": len(deals), "payer": payer,
