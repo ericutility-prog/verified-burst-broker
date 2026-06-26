@@ -1,0 +1,18 @@
+# Keep secrets, wallets, local state, and build cruft out of the image.
+.env
+.testnet_wallets.json
+.relayer_wallet.json
+.mainnet_selftest_buyer.json
+*.db
+*.db-wal
+*.db-shm
+.venv/
+__pycache__/
+*.pyc
+.git/
+client/dist/
+client/build/
+client/*.egg-info/
+*_report.json
+proof_results.json
+finish_subdomain.log
