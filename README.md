@@ -1,63 +1,127 @@
-# verified-burst broker
+# Verified Burst
 
-Sell **verified inference bursts** on Cerebras. An agent hits a hard / irreversible /
-low-confidence decision and **buys more thinking**: escalate to fast silicon →
-best-of-N → verify → **pay per burst over x402, charged only if the answer passes**.
-Budget-capped per agent.
+**Pay-per-correct inference for agents.** At a hard, irreversible, or low-confidence
+decision, an agent escalates to fast silicon (Cerebras), samples best-of-N, runs the
+answer through a verifier, and settles over **x402 only if it passes**. A non-verified
+result costs nothing.
 
-BYOK passthrough: the customer's tokens are billed to their own Cerebras key — we
-**never mark up tokens**. We charge a small service fee for routing + verification +
-the burst guarantee. (Legal-clean: selling our application, not reselling their API.)
+Live on **Base mainnet** with a **self-hosted facilitator** (no Coinbase dependency).
+The buyer brings their own provider key (**BYOK**) — we sell routing, verification, and
+settlement, never marked-up tokens.
 
-## The wedge — one line for an agent builder
-```json
-{ "mcpServers": { "verified-burst": {
-    "command": "python3", "args": ["/root/inference-burst/mcp_server.py"] } } }
-```
-Their agent gains one tool, `buy_verified_burst(request, strategy, n, verifier, answer_key)`,
-that returns a verified answer + receipt and bills per burst.
+- 🟢 Live endpoint: `https://burst.solcleus.com/v1/burst` (manifest at `GET /v1/info`)
+- 📦 PyPI: [`pip install verified-burst`](https://pypi.org/project/verified-burst/)
+- 🔎 Listed on [x402scan](https://www.x402scan.com/server/d09b513d-cefa-46de-a1c8-34189026c408), [402 Index](https://402index.io), and [Glama](https://glama.ai/mcp/servers/ericutility-prog/verified-burst-broker)
 
-## Files
-| file | role |
-|---|---|
-| `provider.py` | BYOK Cerebras call (OpenAI-compatible). Key never stored/logged. |
-| `burst.py` | verified-burst core: best-of-N + self-consistency / deterministic-check / judge verifiers. `passed` gates settlement. |
-| `pricing.py` | service-fee quote (not a token markup). |
-| `x402_gate.py` | x402 challenge + facilitator verify/settle. **Settle only on `passed`** = pay-only-if-verified. SIM until `X402_FACILITATOR_URL` set. |
-| `broker.py` | orchestration: quote → authorize → burst → settle-IF-verified, + per-agent budget cap. |
-| `server.py` | HTTP surface (`POST /v1/burst`, `GET /v1/quote`, `/healthz`). |
-| `mcp_server.py` | MCP stdio surface — the one-liner. |
-| `measure.py` | the 1-day BYOK measurement harness (offline + live). |
+## Why
 
-## Run
+An agent can already sample itself more (its own best-of-N is correlated — it shares its
+own blind spots). The one thing it *can't* self-supply is an **independent, zero-downside,
+keepable verification**: a different model family checks the answer, you pay only if it
+passes, and you keep the receipt. Because the downside is $0 by construction, an agent's
+budget policy can auto-approve the spend without a human in the loop.
+
+## Quickstart (MCP, one line)
+
 ```bash
-# offline measurement / shape
-python3 measure.py --offline
-# live (needs .env with CEREBRAS_API_KEY)
-python3 measure.py
-# HTTP broker
-PORT=8402 python3 server.py
-# MCP server is launched by the MCP client via the config above
+pip install verified-burst
 ```
 
-## Config (.env, gitignored)
-```
-CEREBRAS_API_KEY=csk-...        # required (BYOK)
-CEREBRAS_MODEL=gpt-oss-120b     # this account: gpt-oss-120b | zai-glm-4.7 (NOT llama)
-# x402 (REAL mode — omit for SIM):
-X402_FACILITATOR_URL=...        # facilitator that verifies/settles payments
-X402_PAY_TO=0x...               # seller wallet that receives USDC
-X402_USDC_ASSET=0x...           # USDC contract on the chosen network
-X402_NETWORK=base-sepolia
+Add the server to your MCP client — the agent gains one tool, `buy_verified_burst`:
+
+```json
+{
+  "mcpServers": {
+    "verified-burst": {
+      "command": "verified-burst",
+      "env": {
+        "BURST_BUYER_KEY": "0x<wallet-private-key-that-pays-per-call>",
+        "BURST_PROVIDER_KEY": "csk-<your-cerebras-key>"
+      }
+    }
+  }
+}
 ```
 
-## Go-live checklist
-- [ ] **x402 creds**: facilitator URL + seller wallet (`X402_PAY_TO`) + USDC asset. Until set, payments run in **SIM** (flow is real, settlement is stubbed).
-- [ ] **Verify pricing**: `gpt-oss-120b` per-token rate (current placeholder is UNVERIFIED) and set `FEES` in `pricing.py` to a margin you've checked.
-- [ ] **Pick the verifier per use case**: `self_consistency` (cheap, default), `judge` (adversarial, costs an extra call), or a caller `deterministic_check` (gold standard).
-- [ ] **Budget cap**: `broker.DEFAULT_BUDGET_USD` — wire to the AgentsPrice margin governor for real per-agent caps.
-- [ ] **Cerebras gotcha**: requests need a browser-ish `User-Agent` or Cloudflare returns 403 error 1010 (already handled).
+- `BURST_BUYER_KEY` — the wallet that pays per verified burst (USDC on Base). **Required** for live settlement.
+- `BURST_PROVIDER_KEY` — your Cerebras key; bursts run on **your** tokens (BYOK). Optional.
+- `BURST_ENDPOINT` — defaults to the hosted broker; override to self-host.
 
-## Status (2026-06-15)
-Core + both surfaces run **live against real Cerebras**. Verified→charged, failed→not
-charged, no-payment→402, budget-cap→refused — all confirmed. x402 in SIM pending creds.
+The tool:
+
+```
+buy_verified_burst(request, strategy="best_of_n", n=3,
+                   verifier="self_consistency", answer_key=None)
+  -> { answer, verified, charged, receipt, settle_tx }
+```
+
+## How it works
+
+```
+request → escalate to fast silicon → best-of-N → verify → settle ONLY if passed
+                                                              ↑ pay-only-if-verified
+```
+
+1. **402 challenge** — `GET /v1/burst` returns the x402 payment requirements (Base mainnet, USDC).
+2. **Authorize** — the client signs an x402 (EIP-3009) authorization for the quoted price.
+3. **Burst** — the answer is generated on the buyer's BYOK key and gated through the chosen verifier.
+4. **Settle** — USDC is captured **only if the verifier passes**. A miss settles nothing.
+
+Every response includes a **keepable receipt** (`verified`, `corrected`, `independent`,
+generator/verifier model, `settle_tx`) so verified decisions compound into memory.
+
+## Verifiers
+
+| verifier | what it does | cost to you |
+|---|---|---|
+| `self_consistency` | best-of-N must agree | free (BYOK) |
+| `judge` | an adversarial judge checks the answer | free (BYOK) |
+| `independent_judge` | a **different model family** judges (decorrelated errors) | small |
+| `independent_quorum` | k-of-M independent judges across vendors | small |
+
+Independence is the moat: `independent_judge`/`independent_quorum` are judged on models
+in a different family (and, where configured, a different vendor) than the generator, so
+the check doesn't share the generator's blind spots.
+
+## Pricing
+
+A small **service fee** per burst (routing + verification + the pay-only-if-verified
+guarantee), paid in USDC on Base — **only on a pass**. Per-burst $0.002 (fast) to
+$0.0045 (independent-judge). Generation tokens are billed to the buyer's own key; we
+never mark up tokens. Hard per-wallet spend cap; abuse breakers on the judge path.
+
+## Proof
+
+This is live and settling real money. End-to-end mainnet settlement proof on BaseScan:
+[`0x76921c33…d359c4`](https://basescan.org/tx/0x76921c33f6c83e78757b8218c101ac362ab19ba994ded6743b9bbb2defd359c4).
+
+A reproducible catch-rate harness ([`proof_harness.py`](proof_harness.py) → `PROOF.md`)
+generates code-checkable items and runs the real product path. At N=120 the base model
+was 86.7% accurate; the independent judge caught **16/16** mistakes with **0 false-confirms**
+(never charged for a wrong answer) and a 3.8% false-alarm rate (free redo).
+
+> **Honest caveat:** that result is the *checkable-answer* regime (arithmetic, counting,
+> labels) — the verifier's strongest suit and the product's stated sweet spot. It does
+> **not** prove catch rate on fuzzy/subjective decisions, and 16 mistakes is a modest
+> denominator. Claims are kept to what's measured.
+
+## HTTP API
+
+| route | purpose |
+|---|---|
+| `GET /v1/info` | discovery manifest (capabilities, pricing, verifier enum) |
+| `GET /v1/burst` | x402 challenge for the paid resource (also advertised in `WWW-Authenticate` / `PAYMENT-REQUIRED` headers) |
+| `POST /v1/burst` | buy a verified burst (send `X-PAYMENT`; BYOK via `X-Provider-Key`) |
+| `GET /v1/quote` | price a burst without buying |
+| `GET /healthz` | liveness |
+
+## Self-hosting
+
+The broker is stdlib-Python plus the live-payment deps in `requirements-live.txt`.
+Run `PORT=8402 python3 server.py` behind a TLS proxy; set `X402_MODE=live` with a relayer
+wallet and `X402_PAY_TO`. The MCP stdio server is `mcp_server.py` (sim mode needs no
+secrets — it starts and introspects out of the box).
+
+---
+
+Built honestly: only what's measured is claimed. Questions or integrations welcome.
