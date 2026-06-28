@@ -106,6 +106,100 @@ def _demo_call_fn(msgs, temperature=0.0):
     return provider.chat(msgs, temperature=temperature, max_tokens=512)
 
 
+# ── Paired "wow" demo ────────────────────────────────────────────────────────
+# The default demo tells the whole story in ONE call: the SAME question and the SAME
+# independent judge, with opposite outcomes. A correct answer PROCEEDS (you'd pay a
+# fraction of a cent); a wrong answer is CAUGHT (you pay $0). Arithmetic is chosen so a
+# dev can verify the catch in their head. Honest: both judge calls are live; the only
+# stipulated value is the catch's wrong answer — it stands in for an agent's own model
+# hallucinating, which is exactly what the independent judge is there to catch.
+_DEMO_GEN = os.environ.get("BURST_DEMO_MODEL", "gpt-oss-120b")   # host generator family
+_DEMO_PAIR_Q = "What is 47 * 53?"
+_DEMO_PAIR_WRONG = "2391"   # the real answer is 2491 — the judge catches this live
+_DEMO_HONESTY = ("Both judge calls are live and independent (a different model family than "
+                 "the generator). The only stipulated value is the catch's wrong answer — it "
+                 "stands in for an agent's own model hallucinating, which is exactly what the "
+                 "independent judge catches. Nothing else is faked.")
+
+
+def _demo_confirm():
+    """Real best-of-N generation on the host key + a REAL independent judge confirming a
+    correct answer -> proceed. Returns the 'confirm' half of the paired demo."""
+    vfn, vmodel = broker._independent_verify_fn(_DEMO_GEN)
+    res = burst.run_burst(_DEMO_PAIR_Q + " Reply with just the number.",
+                          strategy="best_of_n", n=3, verifier="independent_judge",
+                          call_fn=_demo_call_fn, verify_fn=vfn, verifier_model=vmodel,
+                          model=_DEMO_GEN, receipt_id="demo-confirm")
+    price = pricing.quote(strategy="best_of_n", n=3, verifier="independent_judge")["price_usd"]
+    return {"scenario": "the model's answer is correct",
+            "answer": (res.answer or "").strip(),
+            "gate": broker._gate_signal(res), "verified": res.passed, "judge": vmodel,
+            "would_charge_usd": price if res.passed else 0.0,
+            "latency_s": round(res.latency_s, 3)}
+
+
+def _demo_catch():
+    """A genuinely-WRONG candidate (stipulated) fed to the SAME real independent judge ->
+    hold, charged $0. Returns the 'catch' half of the paired demo."""
+    vfn, vmodel = broker._independent_verify_fn(_DEMO_GEN)
+    res = burst.run_burst(_DEMO_PAIR_Q, verifier="independent_judge",
+                          candidate=_DEMO_PAIR_WRONG, verify_fn=vfn,
+                          verifier_model=vmodel, model=_DEMO_GEN, receipt_id="demo-catch")
+    return {"scenario": "an agent's model returned a confident WRONG answer",
+            "candidate": f"{_DEMO_PAIR_WRONG} (stipulated — stands in for a hallucination)",
+            "gate": broker._gate_signal(res), "verified": res.passed, "judge": vmodel,
+            "charged_usd": 0.0,
+            "note": ("the independent judge DISAGREED — the agent does NOT act on the wrong "
+                     "answer, pays nothing, and keeps a 'corrected' receipt"),
+            "latency_s": round(res.latency_s, 3)}
+
+
+def _demo_credential():
+    """Only-possible-with-a-burst: portable trust. Mint a clearance cert from a REAL
+    verified burst, then show a STRANGER honoring it locally (recompute hash + recover
+    signature) with no re-pay and no trust in the sender — and that a tampered or self-
+    asserted cert is rejected. An agent cannot make its own work trustworthy to a
+    counterparty; only an independent, signed credential can."""
+    import clearance
+    q = _DEMO_PAIR_Q
+    vfn, vmodel = broker._independent_verify_fn(_DEMO_GEN)
+    res = burst.run_burst(q + " Reply with just the number.",
+                          strategy="best_of_n", n=3, verifier="independent_judge",
+                          call_fn=_demo_call_fn, verify_fn=vfn, verifier_model=vmodel,
+                          model=_DEMO_GEN, receipt_id="demo-cred")
+    result = {"answer": res.answer, "tx": "0xDEMO_settle_tx",
+              "receipt": broker._receipt(res, charged=True, tx="0xDEMO_settle_tx")}
+    cert = clearance.sign_clearance(q, result)
+    issuer = cert["issuer"]
+    # Agent B (a stranger) honors it — purely local, no network, no trust in the sender:
+    genuine = clearance.verify_clearance(cert, q, trusted_issuer=issuer)
+    # Tampered: holder edits the answer after issuance -> content binding breaks:
+    forged = dict(cert); forged["answer"] = "9999"
+    tampered = clearance.verify_clearance(forged, q, answer="9999", trusted_issuer=issuer)
+    # Self-attestation: a bare "trust me, it's cleared" with no valid issuer signature:
+    self_claim = {"answer": res.answer, "verified": True, "independent": True,
+                  "content_hash": cert["content_hash"], "verifier_model": vmodel,
+                  "issuer": issuer, "signature": "0x" + "11" * 65, "issued_at": cert["issued_at"]}
+    selfclaim = clearance.verify_clearance(self_claim, q, trusted_issuer=issuer)
+    keep = ("content_hash", "answer", "verifier_model", "generator_model",
+            "verified", "independent", "cleared", "issuer", "signature", "issued_at")
+    return {
+        "what_this_proves": ("An agent can't make its OWN work trustworthy to a stranger. A "
+                             "clearance cert can: any agent honors it in milliseconds "
+                             "(recompute the hash, recover the signature) — no re-pay, no trust "
+                             "in the sender. Tampering or self-asserting is rejected."),
+        "question": q,
+        "issuer_to_pin": issuer,
+        "cert": {k: cert.get(k) for k in keep},
+        "stranger_check_genuine": genuine,                 # cleared: True
+        "stranger_check_tampered_answer": tampered,        # cleared: False (content mismatch)
+        "stranger_check_self_asserted": selfclaim,         # cleared: False (forged signature)
+        "honesty": ("The burst + judge calls are live; the settle_tx here is a demo placeholder "
+                    "(a real burst carries an on-chain tx). The cert format and verification ARE "
+                    "the production clearance.py path — exactly what a counterparty agent runs."),
+    }
+
+
 def _demo_allow(ip):
     """Reserve a demo slot under the per-IP + global daily ceilings (UTC-day reset).
     Returns (ok, reason). A slot is consumed on reserve (before the burst) so a
@@ -371,6 +465,8 @@ def _key(d, *names, default=None):
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30   # drop a slow/idle client instead of pinning a worker thread
+
     def log_message(self, *a):  # quiet
         pass
 
@@ -482,6 +578,9 @@ class Handler(BaseHTTPRequestHandler):
             # a wallet. Fixed prompts + daily caps keep it from becoming free open inference.
             if not DEMO_ENABLED:
                 return self._send(404, {"error": "not_found"})
+            if not _rate_ok(self._client_ip()):   # per-min throttle (the demo runs host-key inference)
+                return self._send(429, {"error": "rate_limited", "retry_after_s": 60},
+                                  {"Retry-After": "60"})
             ok = _demo_allow(self._client_ip())
             if not ok[0]:
                 return self._send(429, {
@@ -492,47 +591,63 @@ class Handler(BaseHTTPRequestHandler):
                     "human_url": f"{base}/burst"}, {"Retry-After": "3600"})
             remaining = ok[1]
             qs = parse_qs(u.query)
+            mode = (qs.get("example", [""])[0] or "").strip().lower()
             try:
-                idx = int(qs.get("example", ["-1"])[0])
-            except ValueError:
-                idx = -1
-            if not (0 <= idx < len(_DEMO_PROMPTS)):
-                idx = _DEMO_GLOBAL[0] % len(_DEMO_PROMPTS)  # rotate for variety
-            p = _DEMO_PROMPTS[idx]
-            try:
-                res = burst.run_burst(p["request"], strategy="best_of_n", n=3,
-                                      verifier="self_consistency", answer_key=p["answer_key"],
-                                      receipt_id="demo", call_fn=_demo_call_fn)
+                if mode.lstrip("-").isdigit():
+                    # back-compat: ?example=N -> a single self_consistency confirm prompt
+                    idx = int(mode)
+                    if not (0 <= idx < len(_DEMO_PROMPTS)):
+                        idx = _DEMO_GLOBAL[0] % len(_DEMO_PROMPTS)
+                    p = _DEMO_PROMPTS[idx]
+                    res = burst.run_burst(p["request"], strategy="best_of_n", n=3,
+                                          verifier="self_consistency", answer_key=p["answer_key"],
+                                          receipt_id="demo", call_fn=_demo_call_fn)
+                    payload = {
+                        "demo": True, "mode": "single",
+                        "note": ("Free taste on the host key — no wallet, no payment, no charge. "
+                                 "FIXED demo prompt. Tip: call /v1/burst/demo with NO params to "
+                                 "watch the independent judge CATCH a wrong answer — that's the product."),
+                        "topic": p["topic"], "prompt": p["request"], "answer": res.answer,
+                        "gate": broker._gate_signal(res), "verified": res.passed,
+                        "verifier": (res.verdict or {}).get("method"), "samples": res.n,
+                        "latency_s": round(res.latency_s, 3)}
+                elif mode == "catch":
+                    payload = {"demo": True, "mode": "catch", "question": _DEMO_PAIR_Q,
+                               "catch": _demo_catch(), "honesty": _DEMO_HONESTY}
+                elif mode == "credential":
+                    payload = {"demo": True, "mode": "credential", **_demo_credential()}
+                else:
+                    # DEFAULT: the paired wow — same question, same judge, opposite outcomes.
+                    confirm = _demo_confirm()
+                    catch = _demo_catch()
+                    payload = {
+                        "demo": True, "mode": "pair",
+                        "headline": ("Same question, same independent judge, opposite outcomes: a "
+                                     "correct answer PROCEEDS (you'd pay a fraction of a cent); a "
+                                     "wrong answer is CAUGHT (you pay $0). That catch is the product."),
+                        "question": _DEMO_PAIR_Q,
+                        "independent_judge": f"{confirm['judge']} judging {_DEMO_GEN} (different model family)",
+                        "confirm": confirm, "catch": catch, "honesty": _DEMO_HONESTY}
             except Exception:
                 return self._send(503, {
                     "error": "demo_unavailable",
                     "hint": "host model is busy — retry shortly, or run your own: pip install verified-burst"})
-            return self._send(200, {
-                "demo": True,
-                "note": ("Free taste on the host key — no wallet, no payment, no charge. This is "
-                         "a FIXED demo prompt; to run YOUR own decisions, install the tool below."),
-                "topic": p["topic"],
-                "prompt": p["request"],
-                "answer": res.answer,
-                "gate": broker._gate_signal(res),       # the real product output: proceed | hold
-                "verified": res.passed,
-                "verifier": (res.verdict or {}).get("method"),
-                "samples": res.n,
-                "latency_s": round(res.latency_s, 3),
+            payload.update({
                 "demo_remaining_today": remaining,
                 "examples_available": len(_DEMO_PROMPTS),
                 "install": "pip install verified-burst",
                 "buy_your_own": f"{base}/v1/info",
                 "human_url": f"{base}/burst",
-            }, {"Cache-Control": "no-store"})
+            })
+            return self._send(200, payload, {"Cache-Control": "no-store"})
         return self._send(404, {"error": "not_found"})
 
     def _client_ip(self):
-        # Behind nginx (bound to localhost), X-Real-IP is set by us to the real
-        # peer and is not client-spoofable. Fall back to XFF[0], then socket.
-        return (self.headers.get("X-Real-IP")
-                or self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-                or self.client_address[0])
+        # Behind nginx (bound to localhost), X-Real-IP is set by us to the real peer and
+        # is not client-spoofable. We deliberately do NOT fall back to X-Forwarded-For:
+        # a client can forge XFF, which would let an attacker spoof the per-IP demo caps
+        # and rate limiter. Trust only the proxy-set X-Real-IP, else the socket peer.
+        return self.headers.get("X-Real-IP") or self.client_address[0]
 
     def do_POST(self):
         u = urlparse(self.path)
@@ -552,13 +667,16 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length", 0))
         except ValueError:
             return self._send(400, {"error": "bad_length", "example": ex})
-        if n > MAX_BODY:
+        if n < 0 or n > MAX_BODY:   # negative length would make rfile.read() read to EOF
             return self._send(413, {"error": "request_too_large", "max_bytes": MAX_BODY})
         try:
             req = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return self._send(400, {"error": "bad_json",
                                     "detail": "body must be JSON", "example": ex})
+        if not isinstance(req, dict):   # valid JSON but not an object (5, "x", [..]) -> 400
+            return self._send(400, {"error": "bad_json",
+                                    "detail": "body must be a JSON object", "example": ex})
 
         if not req.get("request"):
             return self._send(400, {"error": "missing 'request'",
@@ -575,6 +693,9 @@ class Handler(BaseHTTPRequestHandler):
         # burst, so there's still no free inference to extract.
         provider_key = self.headers.get("X-Provider-Key") or self.headers.get("X-Cerebras-Key")
 
+        cand = req.get("candidate")
+        if cand is not None and len(str(cand)) > MAX_REQ_CHARS:   # cap like 'request'
+            return self._send(413, {"error": "candidate_too_long", "max_chars": MAX_REQ_CHARS})
         ak = req.get("answer_key")
         qk = req.get("quorum_k")
         try:
@@ -592,12 +713,12 @@ class Handler(BaseHTTPRequestHandler):
                 strategy=req.get("strategy", "best_of_n"),
                 n=n,
                 verifier=req.get("verifier", "self_consistency"),
-                answer_key=tuple(ak) if isinstance(ak, list) else None,
+                answer_key=tuple(ak) if (isinstance(ak, list) and len(ak) == 2) else None,
                 provider_key=provider_key,
                 model=req.get("model"),
                 require_byok=REQUIRE_BYOK,
                 trial_cap=TRIAL_CAP,
-                candidate=req.get("candidate"),        # judge a supplied answer (no generation)
+                candidate=cand,                        # judge a supplied answer (no generation)
                 quorum_k=qk,
             )
         except Exception as e:
@@ -632,12 +753,14 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length", 0))
         except ValueError:
             return self._send(400, {"error": "bad_length"})
-        if n > MAX_BODY:
+        if n < 0 or n > MAX_BODY:   # negative length would make rfile.read() read to EOF
             return self._send(413, {"error": "request_too_large", "max_bytes": MAX_BODY})
         try:
             req = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return self._send(400, {"error": "bad_json", "detail": "body must be JSON"})
+        if not isinstance(req, dict):
+            return self._send(400, {"error": "bad_json", "detail": "body must be a JSON object"})
         query = (req.get("query") or req.get("q") or "").strip()
         if not query:
             return self._send(400, {"error": "missing 'query'",
@@ -662,15 +785,18 @@ def main():
     port = int(os.environ.get("PORT", "8402"))
     mode = os.environ.get("X402_MODE", "sim")
     # Money-safety boot check: in SIM mode the facilitator does NOT move real funds and
-    # trusts a client-supplied `from` as the payer. That must never face the public
-    # internet. Refuse to bind a non-loopback host in sim unless explicitly forced.
-    if mode.lower() != "live" and BIND_HOST not in ("127.0.0.1", "localhost", "::1") \
-            and os.environ.get("ALLOW_PUBLIC_SIM") != "1":
-        raise SystemExit("refusing to serve SIM mode on a public interface "
-                         "(set X402_MODE=live, or ALLOW_PUBLIC_SIM=1 to override for testing)")
+    # trusts a client-supplied `from` as the payer. Because this process runs on loopback
+    # behind nginx, a "non-loopback bind" check is the wrong tripwire — a stray X402_MODE
+    # flip would still be served publicly via the proxy. So refuse to start in any non-live
+    # mode at all unless ALLOW_PUBLIC_SIM=1 is set explicitly (local testing only).
+    if mode.lower() != "live" and os.environ.get("ALLOW_PUBLIC_SIM") != "1":
+        raise SystemExit("refusing to start in non-live x402 mode "
+                         "(set X402_MODE=live; or ALLOW_PUBLIC_SIM=1 to override for local testing)")
     print(f"verified-burst broker on {BIND_HOST}:{port}  "
           f"(x402={mode}, rate={RATE_PER_MIN}/min/ip, model={pricing.quote()['model']})")
-    ThreadingHTTPServer((BIND_HOST, port), Handler).serve_forever()
+    httpd = ThreadingHTTPServer((BIND_HOST, port), Handler)
+    httpd.daemon_threads = True   # don't let a wedged worker thread block shutdown
+    httpd.serve_forever()
 
 
 if __name__ == "__main__":

@@ -206,10 +206,16 @@ def _():
     return "def log_message(self, *a):  # quiet" in src, "request logging is silenced"
 
 
-@check("SIM mode refuses to bind a public interface", "config", "high")
+@check("non-live x402 mode refuses to start without explicit override", "config", "high")
 def _():
+    # The broker runs on loopback behind nginx, so a "public bind" tripwire is the wrong
+    # shape — a stray X402_MODE flip would still be proxied publicly. The guard must refuse
+    # to start in ANY non-live mode unless ALLOW_PUBLIC_SIM=1 is set (local testing only).
     src = open(os.path.join(os.path.dirname(__file__), "server.py")).read()
-    return "refusing to serve SIM mode on a public interface" in src, "boot guard present"
+    ok = ('refusing to start in non-live x402 mode' in src
+          and 'ALLOW_PUBLIC_SIM' in src
+          and 'mode.lower() != "live"' in src)
+    return ok, "live-only boot guard present (sim requires ALLOW_PUBLIC_SIM)"
 
 
 # ---------------------------------------------------------------------------
