@@ -38,6 +38,8 @@ _DOMAIN = "vb-clearance-v1"
 # verify_clearance so a cert also proves payment cleared, not just an independent check;
 # (2) publish _DOMAIN + the _signed_payload shape as an OPEN SPEC so other parties can
 # mint/verify certs — that is what turns this from a local gate into a network standard.
+# SPEC: the v1 wire format (this module's shapes) is written up in SPEC-clearance-v1.md;
+# the federated-commons architecture + the enforcer/bootstrap blocker are in COMMONS_DESIGN.md.
 
 
 def _content_hash(request: str, answer: str, verifier_model: str | None) -> str:
