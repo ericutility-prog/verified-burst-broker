@@ -19,3 +19,8 @@ audit_report.json
 guardian_report.json
 security_report.json
 proof_results.json
+
+# outside-buyer watch — runtime artifacts (state/logs), not source
+.outside_watch_state.json
+outside_watch.log
+outside_watch.latest.txt
