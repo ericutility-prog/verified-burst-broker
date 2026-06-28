@@ -44,6 +44,10 @@ _conn.executescript(
         day  INTEGER NOT NULL,
         used INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS seen_nonce (
+        k  TEXT PRIMARY KEY,   -- dedup key for a signed x402 authorization
+        ts REAL NOT NULL       -- when first claimed (for optional pruning)
+    );
     """
 )
 _conn.commit()
@@ -173,12 +177,27 @@ def global_judge_reserve(judges: int, daily_cap: int) -> bool:
         return True
 
 
+# --- single-use payment authorizations -------------------------------------- #
+def claim_nonce(key: str) -> bool:
+    """Atomically record a signed-payment dedup key as USED. Returns True if newly
+    claimed (this request may proceed), False if it was already seen (replay / a
+    concurrent fan-out of the same authorization → reject). INSERT OR IGNORE under the
+    lock makes the claim race-free, so K parallel requests sharing one payment yield
+    exactly one True. This is what stops a single payment from buying many results
+    before it settles on-chain."""
+    with _LOCK, _conn:
+        cur = _conn.execute(
+            "INSERT OR IGNORE INTO seen_nonce(k, ts) VALUES(?, ?)", (key, time.time()))
+        return cur.rowcount > 0
+
+
 # --- test / maintenance ----------------------------------------------------- #
 def reset_all() -> None:
     """Wipe the ledger — for tests only (production never calls this)."""
     with _LOCK, _conn:
         _conn.execute("DELETE FROM ledger")
         _conn.execute("DELETE FROM global_judge")
+        _conn.execute("DELETE FROM seen_nonce")
 
 
 def db_path() -> str:

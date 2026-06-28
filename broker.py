@@ -5,12 +5,44 @@ whole product in ~40 lines: the buyer is charged only when the verifier passes, 
 never beyond their per-agent budget cap (the governor that lets builders trust
 autonomous spend).
 """
+import base64
+import hashlib
+import json
 import os
 
 import pricing
 import provider
 import burst as burst_mod
 from x402_gate import Facilitator, build_requirements
+
+
+def _payment_key(x_payment):
+    """A stable, unforgeable dedup key for a signed x402 authorization — its nonce +
+    signature. Used to make a payment single-use (no replay, no concurrent fan-out).
+    Returns None when the payment can't be decoded (the SIM/test facilitator shapes),
+    which is safe: sim is loopback-only by the boot guard, so there's nothing to dedup."""
+    if not x_payment or not isinstance(x_payment, str):
+        return None
+    try:
+        obj = json.loads(base64.b64decode(x_payment, validate=True))
+        payload = obj.get("payload") or {}
+        auth = payload.get("authorization") or {}
+        sig = payload.get("signature") or ""
+        nonce = auth.get("nonce") or ""
+        if not (sig or nonce):
+            return None
+        return hashlib.sha256(f"{nonce}|{sig}".encode()).hexdigest()
+    except Exception:
+        return None
+
+
+def _settle_failed(payer, budget_cap):
+    """Verifier passed but the payment did not capture on-chain. The result is withheld
+    and nothing is charged; the buyer signs a fresh payment to retry."""
+    return {"status": "settle_failed", "charged": False, "price_usd": 0.0, "payer": payer,
+            "hint": ("payment capture did not confirm on-chain — the result is withheld "
+                     "and you were NOT charged; retry with a fresh payment"),
+            "remaining_budget_usd": round(remaining_budget(payer, budget_cap), 6)}
 
 # ───────────────────────────────────────────────────────────────────────────
 # ROADMAP — where the next expansions plug in. `grep -rn ">>> EXTENSION POINT"`
@@ -227,6 +259,16 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
                 "reason": auth.get("reason")}
     payer = auth.get("payer", "unknown")
 
+    # 1b) single-use payment: claim the authorization's nonce atomically BEFORE doing any
+    #     work, so the same signed payment can't be replayed or fanned out across
+    #     concurrent requests to extract multiple results before it settles on-chain.
+    #     (Skipped for sim/test payments that don't decode — those are loopback-only.)
+    pay_key = _payment_key(x_payment)
+    if pay_key is not None and not ledger.claim_nonce(pay_key):
+        return {"status": "payment_already_used", "payer": payer,
+                "hint": ("this x402 authorization was already used — sign a fresh "
+                         "payment per burst (authorizations are single-use)")}
+
     # 2) BYOK / free-trial gate. With no BYOK key, a wallet may run on the HOST key
     #    for its first `trial_cap` bursts, then must bring its own key. The payment
     #    was already validated above, so trial bursts still prove a funded wallet.
@@ -320,17 +362,25 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
                 "budget_cap_usd": budget_cap,
                 "trial": is_trial, "trial_remaining": trial_remaining}
 
-    s = fac.settle(x_payment, reqs)
-    if s["success"]:
-        ledger.commit(payer, q["price_usd"])    # hold -> settled spend
-    else:
-        ledger.release(payer, q["price_usd"])   # settle failed -> no money moved, free the hold
-    ledger.clear_misses(payer)                  # a pass clears the abuse streak
-    return {"status": "ok", "charged": bool(s["success"]), "price_usd": q["price_usd"],
+    # The verifier PASSED — but we only hand over the result if the on-chain capture
+    # actually confirms. If settle errors or returns failure, WITHHOLD the answer and
+    # release the hold: delivering a passing result without a captured payment would
+    # break pay-only-if-verified (and let a reverted/expired auth buy free results).
+    try:
+        s = fac.settle(x_payment, reqs)
+    except Exception:
+        ledger.release(payer, q["price_usd"])   # settle errored -> no money moved, free the hold
+        return _settle_failed(payer, budget_cap)
+    if not s["success"]:
+        ledger.release(payer, q["price_usd"])   # settle didn't confirm -> free the hold
+        return _settle_failed(payer, budget_cap)
+    ledger.commit(payer, q["price_usd"])        # hold -> settled spend
+    ledger.clear_misses(payer)                  # a SETTLED pass clears the abuse streak
+    return {"status": "ok", "charged": True, "price_usd": q["price_usd"],
             "gate": _gate_signal(res),                   # action=proceed — verified, safe to act
             "tx": s.get("tx"), "mode": s.get("mode"), "verdict": res.verdict,
             "answer": res.answer, "payer": payer, "latency_s": res.latency_s,
-            "receipt": _receipt(res, charged=bool(s["success"]), tx=s.get("tx")),  # keep -> compounds
+            "receipt": _receipt(res, charged=True, tx=s.get("tx")),  # keep -> compounds
             "cost_basis": res.cost_basis, "receipt_id": res.receipt_id,
             "remaining_budget_usd": round(remaining_budget(payer, budget_cap), 6),
             "budget_cap_usd": budget_cap,

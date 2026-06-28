@@ -69,6 +69,12 @@ def serve_search(query, *, x_payment=None, budget_cap=broker.DEFAULT_BUDGET_USD,
                 "reason": auth.get("reason")}
     payer = auth.get("payer", "unknown")
 
+    # single-use payment: reject replay / concurrent fan-out of one authorization
+    pay_key = broker._payment_key(x_payment)
+    if pay_key is not None and not ledger.claim_nonce(pay_key):
+        return {"status": "payment_already_used", "payer": payer,
+                "hint": "this x402 authorization was already used — sign a fresh payment per search"}
+
     if q["price_usd"] > broker.remaining_budget(payer, budget_cap):
         return {"status": "budget_exceeded", "payer": payer,
                 "remaining_usd": round(broker.remaining_budget(payer, budget_cap), 6),
@@ -88,10 +94,18 @@ def serve_search(query, *, x_payment=None, budget_cap=broker.DEFAULT_BUDGET_USD,
                 "query": query, "source": result.get("source"), "payer": payer,
                 "remaining_budget_usd": round(broker.remaining_budget(payer, budget_cap), 6)}
 
-    s = fac.settle(x_payment, reqs)
-    if s["success"]:
-        ledger.commit(payer, q["price_usd"])
-    return {"status": "ok", "charged": bool(s["success"]), "price_usd": q["price_usd"],
+    # only hand over results if the capture actually confirms on-chain
+    try:
+        s = fac.settle(x_payment, reqs)
+    except Exception:
+        s = {"success": False}
+    if not s["success"]:
+        return {"status": "settle_failed", "charged": False, "price_usd": 0.0,
+                "query": query, "payer": payer,
+                "hint": ("payment capture did not confirm — results withheld and you were "
+                         "NOT charged; retry with a fresh payment")}
+    ledger.commit(payer, q["price_usd"])
+    return {"status": "ok", "charged": True, "price_usd": q["price_usd"],
             "tx": s.get("tx"), "mode": s.get("mode"),
             "query": query, "result": result, "count": len(deals), "payer": payer,
             "remaining_budget_usd": round(broker.remaining_budget(payer, budget_cap), 6),
