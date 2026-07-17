@@ -142,12 +142,22 @@ DEFAULT_BUDGET_USD = float(os.environ.get("BURST_BUDGET_USD", "1.00"))  # per-ag
 # (ledger-backed), so a restart can't reset an attacker's streak:
 #   Rule 1 = independent_judge requires BYOK (never host-key) -> a miss costs us at most
 #            the ~$0.0004 judge call, never the buyer's generation.
-#   Rule 2 = an UNPROVEN wallet (never settled) is cut off after IJ_MISS_LIMIT
-#            consecutive misses; a PROVEN payer (settled >=1) is never locked.
+#   Rule 2 = a wallet is cut off once its LIFETIME independent-miss count exceeds its
+#            allowance (_miss_limit): unproven wallets get the flat IJ_MISS_LIMIT; proven
+#            payers get revenue-scaled headroom. Misses are CUMULATIVE (not reset on a
+#            pass), so the allowance is a CONSUMABLE budget, not a resettable ceiling —
+#            each extra free miss must be "paid for" by settled spend that raised the
+#            limit, keeping total free judge-burn bounded by (in fact below) revenue.
 #   Rule 3 = a GLOBAL daily ceiling on judge calls from unproven wallets, so Sybil
 #            wallet-rotation can't defeat the per-wallet breaker.
 IJ_MISS_LIMIT = int(os.environ.get("IJ_MISS_LIMIT", "3"))
 IJ_GLOBAL_DAILY = int(os.environ.get("IJ_GLOBAL_DAILY", "2000"))   # judge calls/day, unproven
+IJ_PROVEN_MISS_UNIT_USD = float(os.environ.get("IJ_PROVEN_MISS_UNIT_USD", "0.003"))  # proven: +1 free-miss of headroom per this much settled spend
+# Same Sybil-rotation cap for the free-trial HOST-key path: an unproven wallet's trial
+# burst runs on our Cerebras key, and a craft-to-fail prompt never settles (its USDC
+# recycles into fresh wallets), so the per-wallet trial_cap alone is defeatable. This is
+# the aggregate daily ceiling on free-trial bursts from unproven wallets.
+TRIAL_GLOBAL_DAILY = int(os.environ.get("TRIAL_GLOBAL_DAILY", "500"))  # trial bursts/day, unproven
 
 
 def trial_used(payer):
@@ -195,7 +205,7 @@ def _gate_signal(res):
         indep = {}
     if res.passed:
         return {"verified": True, "action": "proceed",
-                "advice": "Answer passed the verifier — safe to act on.",
+                "advice": "Answer passed the verifier — OK to proceed (verified, not guaranteed).",
                 "method": meth, "confidence": conf, **indep}
     return {"verified": False, "action": "hold",
             "advice": ("Answer did NOT pass the verifier — DO NOT act on it. Re-try, "
@@ -230,6 +240,50 @@ def _receipt(res, *, charged, tx=None):
         rec["quorum"] = {"k": v.get("k"), "m": v.get("m"), "votes_for": v.get("votes_for"),
                          "judges": [vote.get("verifier_model") for vote in (v.get("votes") or [])]}
     return rec
+
+
+def _confirm_settlement_onchain(tx, pay_to, price_usd):
+    """Defense-in-depth (#6): independently confirm the settle tx really moved >= price USDC
+    to pay_to on-chain BEFORE we commit/deliver — so a facilitator that reports success
+    without a real transfer can't buy a free result. Returns 'ok' (confirmed), 'bad' (receipt
+    proves revert / underpay / wrong-payee -> WITHHOLD), or 'unknown' (sim tx or receipt
+    unreachable -> trust the facilitator rather than block legit revenue on RPC flakiness)."""
+    import clearance
+    if not isinstance(tx, str) or not clearance._HASH_RE.match(tx):
+        return "unknown"                      # sim/demo tx -> nothing on-chain to check
+    if not pay_to:
+        return "unknown"
+    usdc = clearance._USDC.get(clearance._network())
+    if not usdc:
+        return "unknown"
+    rcpt = clearance._default_receipt_fetch(tx)
+    if rcpt is None:
+        return "unknown"                      # RPC unreachable -> don't block revenue
+    try:
+        status = rcpt.get("status") if isinstance(rcpt, dict) else rcpt.status
+        if int(status) != 1:
+            return "bad"
+        got = clearance._usdc_to(rcpt, pay_to, usdc)
+    except Exception:
+        return "unknown"
+    need = int(round(float(price_usd) * 1_000_000))
+    return "ok" if (got > 0 and got >= need) else "bad"
+
+
+def _miss_limit(payer: str) -> int:
+    """LIFETIME-miss allowance before Rule 2 locks a wallet. Unproven -> flat IJ_MISS_LIMIT.
+    Proven -> that plus headroom proportional to settled revenue. Misses are cumulative
+    (never reset on a pass), so this allowance is a CONSUMABLE budget: each settled pass
+    raises it by ~1 per IJ_PROVEN_MISS_UNIT_USD of spend, and each miss consumes 1. An
+    honest paying customer whose passes outrun their (legitimately-caught) misses keeps
+    headroom and is never locked; a tiny-payment attacker cannot ratchet unlimited free
+    judge-burn, because every extra miss must be funded by settled spend that raised the
+    limit — so total free-burn stays below revenue."""
+    base = IJ_MISS_LIMIT
+    s = ledger.spent(payer)
+    if s <= 0.0 or IJ_PROVEN_MISS_UNIT_USD <= 0.0:
+        return base
+    return base + int(s / IJ_PROVEN_MISS_UNIT_USD)
 
 
 def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
@@ -276,6 +330,14 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     if not provider_key and require_byok:
         used = ledger.trial_count(payer)
         if trial_cap and used < trial_cap:
+            # Global Sybil cap (mirrors the independent-judge Rule 3): cap aggregate
+            # host-key trial burn/day from UNPROVEN wallets so wallet rotation can't
+            # defeat the per-wallet trial_cap. Proven payers (settled >=1) bypass.
+            if not ledger.is_proven(payer) and not ledger.global_trial_reserve(1, TRIAL_GLOBAL_DAILY):
+                return {"status": "trial_exhausted", "payer": payer,
+                        "trial_used": used, "trial_cap": trial_cap,
+                        "hint": ("daily free-trial host-inference budget is spent — send "
+                                 "X-Provider-Key with your own Cerebras key, or retry tomorrow")}
             is_trial = True   # runs on the host env key; the slot is consumed after the burst
         else:
             return {"status": "byok_required", "payer": payer,
@@ -298,15 +360,20 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
                              "BYOK; the independent check is on us. (Or pass a 'candidate' "
                              "answer to have us judge it directly, no generation.)"),
                     "verifier": verifier}
-        # Rule 2: an UNPROVEN wallet that keeps missing is burning our judge tokens for
-        # free — cut it off. A proven payer (settled >=1) is never locked.
+        # Rule 2: a wallet burning our judge tokens for free is cut off once its LIFETIME
+        # miss count exceeds its allowance (_miss_limit). The allowance is revenue-scaled
+        # and CONSUMABLE — misses are cumulative (not reset on a pass), so a proven wallet
+        # can't ratchet unlimited free-burn by settling cheap passes: every extra miss must
+        # be funded by settled spend that raised the limit. An honest payer whose passes
+        # outrun their legitimate misses keeps headroom; a tiny-payment attacker stays near
+        # base. (Unproven wallets never pass without settling, so lifetime == streak there.)
         proven = ledger.is_proven(payer)
-        if not proven and ledger.miss_count(payer) >= IJ_MISS_LIMIT:
+        if ledger.miss_count(payer) >= _miss_limit(payer):
             return {"status": "verifier_locked", "payer": payer,
                     "verifier": verifier, "misses": ledger.miss_count(payer),
-                    "hint": ("too many unverified independent bursts on an unproven "
-                             "wallet. Use verifier=self_consistency (free to us, BYOK), or "
-                             "settle one passing burst to unlock broker-paid independence.")}
+                    "hint": ("too many consecutive unverified independent bursts. "
+                             "Use verifier=self_consistency (free to us, BYOK), or settle "
+                             "one passing burst to reset and unlock broker-paid independence.")}
         # Rule 3 (global): cap aggregate host-key judge burn from unproven wallets/day,
         # so wallet rotation can't defeat the per-wallet breaker. Proven payers bypass.
         if not proven and not ledger.global_judge_reserve(judges, IJ_GLOBAL_DAILY):
@@ -374,8 +441,17 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     if not s["success"]:
         ledger.release(payer, q["price_usd"])   # settle didn't confirm -> free the hold
         return _settle_failed(payer, budget_cap)
-    ledger.commit(payer, q["price_usd"])        # hold -> settled spend
-    ledger.clear_misses(payer)                  # a SETTLED pass clears the abuse streak
+    # #6 defense-in-depth: independently confirm the tx really moved the fee on-chain before
+    # we commit/deliver. A facilitator that reports success without a real USDC transfer to
+    # the seller (bug/compromise) is caught here -> withhold the answer, no charge. A sim tx
+    # or an unreachable RPC -> 'unknown' -> trust the facilitator (don't block legit revenue).
+    if _confirm_settlement_onchain(s.get("tx"), os.environ.get("X402_PAY_TO"), q["price_usd"]) == "bad":
+        ledger.release(payer, q["price_usd"])   # chain contradicts the facilitator -> free the hold
+        return _settle_failed(payer, budget_cap)
+    ledger.commit(payer, q["price_usd"])        # hold -> settled spend (raises _miss_limit)
+    # NOTE: misses are LIFETIME-cumulative — a pass does NOT reset them. That makes the
+    # proven free-miss allowance a consumable budget (not a resettable ceiling), so total
+    # free judge-burn stays bounded by revenue. See _miss_limit / Rule 2.
     return {"status": "ok", "charged": True, "price_usd": q["price_usd"],
             "gate": _gate_signal(res),                   # action=proceed — verified, safe to act
             "tx": s.get("tx"), "mode": s.get("mode"), "verdict": res.verdict,

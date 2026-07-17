@@ -13,6 +13,7 @@ product code.
 """
 import json
 import re
+import regex
 import concurrent.futures
 from collections import Counter
 from dataclasses import dataclass, field, asdict
@@ -41,9 +42,12 @@ class BurstResult:
 
 # --------------------------- verifiers --------------------------------------- #
 # >>> EXTENSION POINT (verifiers): add a strategy by writing a verify_* fn here and a
-# branch in run_burst's dispatch below. ReDoS note: _extract's regex screen is a
-# heuristic for the common nested-quantifier class — full safety needs the `regex`
-# module's timeout or subprocess isolation (stdlib `re` can't be interrupted in-thread).
+# branch in run_burst's dispatch below. ReDoS: _extract runs a caller-supplied answer_key
+# regex under the `regex` module's hard timeout (interrupts catastrophic backtracking that
+# stdlib `re` cannot), plus a length cap and a bounded input window.
+_REGEX_TIMEOUT_S = 0.25   # hard wall-clock cap on a caller-supplied answer_key regex match
+
+
 def _extract(text, answer_key):
     """Pull a normalized answer for agreement checks. answer_key:
        None -> whole trimmed text;  ('json', field) -> JSON field;  ('regex', pat) -> group 1."""
@@ -57,24 +61,19 @@ def _extract(text, answer_key):
         except Exception:
             return ""
     if kind == "regex":
-        # Caller-supplied pattern → bound it: cap length and never let a pathological
-        # pattern (ReDoS) crash or wedge the worker. A bad/oversized pattern yields "".
+        # Caller-supplied pattern → bound it three ways so a pathological (ReDoS) pattern
+        # can never crash or WEDGE the worker: (1) cap the pattern length, (2) match only a
+        # bounded input window, and (3) run under the `regex` module's hard timeout, which —
+        # unlike stdlib `re` — interrupts catastrophic backtracking mid-match. This covers
+        # the ENTIRE family, including ungrouped chains like a+a+a+…$ that a ")[*+?{]"
+        # heuristic misses, without falsely rejecting legit extractors like (\d+)? . A bad/
+        # oversized/slow pattern yields "" (never a hang).
         if not isinstance(spec, str) or len(spec) > 200:
             return ""
-        # ReDoS screen: reject ANY group immediately followed by a quantifier —
-        # (...)+ (...)* (...)? (...){n} — which covers the whole catastrophic-backtracking
-        # family: nested quantifiers like (a+)+ / (.*)+ AND quantified alternation like
-        # (a|a)+ / (a|ab)* (the bypass the narrower "quantifier inside the group" check
-        # missed). Legit extractors — (\d+), (yes|no), (\w+) — never put a quantifier
-        # AFTER the group, so they pass. (Heuristic, not a proof — stdlib `re` can't be
-        # interrupted mid-thread; the bounded window below caps the residual, and full
-        # coverage needs the `regex` module's timeout. See security_probe.py frontier.)
-        if re.search(r"\)[*+?{]", spec):
-            return ""
         try:
-            m = re.search(spec, text[:2000])
+            m = regex.search(spec, text[:2000], timeout=_REGEX_TIMEOUT_S)
             return (m.group(1) if (m and m.groups()) else "").strip().lower()
-        except re.error:
+        except Exception:
             return ""
     return text.strip()
 
