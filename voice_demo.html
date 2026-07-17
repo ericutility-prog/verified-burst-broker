@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voice latency — Cerebras vs a typical host — Solcleus</title>
+<meta name="theme-color" content="#16181d">
+<meta name="description" content="Same question, same model, two hosts. Watch (and hear) the dead-air gap before the assistant starts speaking. The timer measures the model compute segment.">
+<style>
+  :root{
+    --bg:#ffffff;--panel:#f6f7f9;--ink:#16181d;--ink2:#3a3f4a;--muted:#697086;
+    --line:#e6e8ec;--accent:#1f6f78;--good:#1f8a52;--slow:#b4531f;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+  .wrap{max-width:1040px;margin:0 auto;padding:0 24px}
+  .lab{font:600 11px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+  header{border-bottom:1px solid var(--line)}
+  header .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+  .mark{font:600 15px/1 var(--mono);letter-spacing:.22em;color:var(--ink)}
+  nav a{font:600 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-left:20px}
+  .hero{padding:40px 0 8px}
+  h1{font-size:31px;line-height:1.14;letter-spacing:-.01em;margin:12px 0 12px;max-width:22ch}
+  .hero p{font-size:16px;color:var(--ink2);max-width:70ch;margin:0 0 6px}
+
+  .ctl{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:22px 0 6px}
+  .ctl input[type=text]{flex:1;min-width:240px;border:1px solid var(--line);border-radius:8px;
+    padding:12px 14px;font:15px/1.4 inherit;background:#fff;color:var(--ink)}
+  .ctl input:focus{outline:none;border-color:var(--accent)}
+  .btn{border:1px solid var(--ink);background:var(--ink);color:#fff;padding:0 18px;height:44px;
+    border-radius:8px;font:600 14px/1 inherit;cursor:pointer}
+  .btn.ghost{background:#fff;color:var(--ink)}
+  .btn:disabled{opacity:.5;cursor:default}
+  .mic{width:44px;padding:0;display:inline-flex;align-items:center;justify-content:center}
+  .mic svg{width:20px;height:20px}
+  .mic.live{background:var(--slow);border-color:var(--slow);color:#fff}
+  select{height:44px;border:1px solid var(--line);border-radius:8px;padding:0 10px;font:14px inherit;background:#fff;color:var(--ink)}
+  .hint{color:var(--muted);font-size:13px;margin:4px 0 0}
+  .asked{font-size:15px;color:var(--ink2);margin:16px 0 4px;min-height:22px}
+  .asked b{color:var(--ink)}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:12px 0 8px}
+  .card{border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+  .card .top{display:flex;align-items:baseline;justify-content:space-between;gap:10px;
+    padding:14px 18px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .card .name{font:700 14px/1 var(--mono);letter-spacing:.04em}
+  .card .sub{font-size:12px;color:var(--muted)}
+  .clock{font:700 34px/1 var(--mono);letter-spacing:.02em;padding:18px 18px 4px;color:var(--ink)}
+  .clock .u{font-size:15px;color:var(--muted);font-weight:600;margin-left:3px}
+  .state{padding:0 18px 6px;font:600 12px/1.2 var(--mono);letter-spacing:.06em;text-transform:uppercase}
+  .state.wait{color:var(--muted)}.state.think{color:var(--slow)}.state.talk{color:var(--good)}
+  .answer{padding:6px 18px 20px;font-size:15px;color:var(--ink);min-height:66px}
+  .card.win .clock{color:var(--good)}
+  .card.win .top{background:#f0f8f3}
+
+  .note{margin:16px 0 46px;padding:14px 16px;border:1px solid var(--line);border-radius:10px;
+    background:var(--panel);color:var(--ink2);font-size:13.5px;max-width:80ch}
+  .note b{color:var(--ink)}
+  footer{padding:26px 0 56px;color:var(--muted);font-size:13px;border-top:1px solid var(--line)}
+  @media(max-width:760px){
+    .grid{grid-template-columns:1fr}h1{font-size:25px}
+    /* header: stack the two nav links under the logo so they don't crowd it */
+    header .wrap{height:auto;min-height:54px;flex-wrap:wrap;justify-content:center;gap:2px 0;padding:8px 0}
+    .mark{font-size:14px;letter-spacing:.14em}
+    nav{width:100%;text-align:center}
+    nav a{margin:0 10px;font-size:10px;letter-spacing:.06em}
+  }
+</style>
+
+<header><div class="wrap">
+  <a class="mark" href="/">SOLCLEUS</a>
+  <nav><a href="/burst">Verified Burst</a><a href="/eleven">Verified Answers</a></nav>
+</div></header>
+
+<div class="wrap">
+  <section class="hero">
+    <div class="lab">Voice latency · live</div>
+    <h1>Same question. Same model. Hear the dead air.</h1>
+    <p>Ask once. Both sides run the <b>same open-weight model</b> — one on a typical GPU host, one on
+      Cerebras. The clock times the <b>model compute step</b>: how long the LLM takes to start
+      answering. It's the part Cerebras changes — a real voice turn also has speech-to-text and
+      text-to-speech, added on <b>both</b> sides.</p>
+
+    <div class="ctl">
+      <button class="btn ghost mic" id="mic" title="Hold-to-talk (Chrome)" aria-label="Hold to talk">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="9" y="2.5" width="6" height="11" rx="3"/>
+          <path d="M6 11a6 6 0 0 0 12 0"/>
+          <line x1="12" y1="17" x2="12" y2="21"/>
+          <line x1="8.5" y1="21" x2="15.5" y2="21"/>
+        </svg>
+      </button>
+      <input type="text" id="q" placeholder="Ask a question — e.g. What's the capital of Australia?" maxlength="400">
+      <button class="btn" id="ask">Ask both</button>
+      <label class="lab" for="voice" style="margin-left:4px">Speak</label>
+      <select id="voice" title="Which side talks out loud">
+        <option value="cerebras">Cerebras only</option>
+        <option value="both">Both</option>
+        <option value="baseline">Baseline only</option>
+        <option value="off">Muted</option>
+      </select>
+      <label class="lab" for="engine" style="margin-left:4px">Engine</label>
+      <select id="engine" title="Voice engine"><option value="browser">Browser</option></select>
+      <label class="lab" for="ttsvoice" style="margin-left:4px">Voice</label>
+      <select id="ttsvoice" title="Text-to-speech voice"></select>
+      <button class="btn ghost" id="preview" title="Preview the selected voice" style="height:44px;padding:0 14px">▶</button>
+    </div>
+    <div class="hint" id="hint">Mic needs Chrome + mic permission (localhost or https). Typing works anywhere.</div>
+    <div class="asked" id="asked"></div>
+  </section>
+
+  <div class="grid">
+    <div class="card" id="card-baseline">
+      <div class="top"><span class="name">TYPICAL GPU HOST</span><span class="sub" id="m-baseline">same model</span></div>
+      <div class="clock"><span id="clk-baseline">0.00</span><span class="u">s</span></div>
+      <div class="state wait" id="st-baseline">idle</div>
+      <div class="answer" id="ans-baseline"></div>
+    </div>
+    <div class="card" id="card-cerebras">
+      <div class="top"><span class="name">CEREBRAS · FAST SILICON</span><span class="sub" id="m-cerebras">same model</span></div>
+      <div class="clock"><span id="clk-cerebras">0.00</span><span class="u">s</span></div>
+      <div class="state wait" id="st-cerebras">idle</div>
+      <div class="answer" id="ans-cerebras"></div>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>What the clock measures:</b> time to first token — the model <i>compute</i> segment, the part
+    Cerebras changes. A real voice product also has speech-to-text, text-to-speech and network hops;
+    those add a <b>fixed overhead on both sides</b> and are not in this number. Same model on both, so
+    it's a fair comparison. Numbers are live and will vary run to run.
+  </div>
+</div>
+
+<footer><div class="wrap">
+  Powered by Cerebras. Want this measured on <i>your</i> workload? <a href="/burst">See a verified burst →</a>
+</div></footer>
+
+<script>
+(function(){
+  var SIDES=["baseline","cerebras"];
+  var el=function(id){return document.getElementById(id);};
+  var q=el("q"), askBtn=el("ask"), asked=el("asked"), hint=el("hint"),
+      micBtn=el("mic"), voiceSel=el("voice");
+  var busy=false, activeAudios=[];
+
+  function esc(s){return String(s==null?'':s).replace(/[<&>]/g,function(c){return{'<':'&lt;','&':'&amp;','>':'&gt;'}[c];});}
+
+  // ---- TTS engine + voice selection ----
+  // Two engines: "premium" = server-side (ElevenLabs/OpenAI, keys stay on server),
+  // "browser" = Web Speech (voices from the OS). Premium is offered only if the
+  // server reports a key via /api/tts-info, and becomes the default when present.
+  var ttsSel=el("ttsvoice"), previewBtn=el("preview"), engineSel=el("engine");
+  var browserVoices=[], serverTTS={available:false,voices:[],default:null,provider:""};
+  // premium (paid) TTS is unlocked only with a filming token in the URL (?key=...);
+  // without it, visitors get the free browser voice and never touch the paid quota.
+  var demoKey=new URLSearchParams(location.search).get("key")||"";
+  var keyQS=demoKey?("?key="+encodeURIComponent(demoKey)):"";
+
+  function premium(){ return serverTTS.available && engineSel.value==="premium"; }
+  function currentVoice(){ return premium()?null:(browserVoices[ttsSel.value]||null); } // browser voice obj
+  function currentVoiceId(){ return premium()?ttsSel.value:null; }                       // server voice id
+
+  function fillVoiceSelect(){
+    ttsSel.innerHTML=""; ttsSel.disabled=false;
+    if(premium()){
+      serverTTS.voices.forEach(function(v){ var o=document.createElement("option");
+        o.value=v.id; o.textContent=v.name; ttsSel.appendChild(o); });
+      if(serverTTS.default) ttsSel.value=serverTTS.default;
+      return;
+    }
+    if(!browserVoices.length){ var o=document.createElement("option"); o.textContent="(system default)";
+      ttsSel.appendChild(o); ttsSel.disabled=true; return; }
+    browserVoices.forEach(function(v,i){ var o=document.createElement("option"); o.value=i;
+      o.textContent=v.name.replace(/^(Google|Microsoft)\s+/,"")+" · "+v.lang; ttsSel.appendChild(o); });
+    var pref=browserVoices.findIndex(function(v){return /google us english|samantha|aria|jenny|natural/i.test(v.name);});
+    if(pref<0) pref=browserVoices.findIndex(function(v){return /en[-_]US/i.test(v.lang);});
+    ttsSel.value=(pref<0?0:pref);
+  }
+  function loadBrowserVoices(){
+    var all=(window.speechSynthesis&&speechSynthesis.getVoices())||[];
+    browserVoices=all.filter(function(v){return /^en/i.test(v.lang);}); if(!browserVoices.length) browserVoices=all;
+    if(!premium()) fillVoiceSelect();
+  }
+  engineSel.addEventListener("change",fillVoiceSelect);
+  if(window.speechSynthesis){ loadBrowserVoices(); speechSynthesis.onvoiceschanged=loadBrowserVoices; }
+
+  // discover server-side premium voices; if available (filming URL), prefer it
+  fetch("/api/tts-info"+keyQS).then(function(r){return r.json();}).then(function(j){
+    if(j&&j.available){ serverTTS={available:true,voices:j.voices||[],default:j.default,provider:j.provider||""};
+      var o=document.createElement("option"); o.value="premium";
+      o.textContent="Premium"+(serverTTS.provider?(" · "+serverTTS.provider):"");
+      engineSel.insertBefore(o,engineSel.firstChild); engineSel.value="premium"; fillVoiceSelect();
+    }
+  }).catch(function(){});
+
+  function fetchPremium(text){   // -> Promise<objectURL|null>; keys stay server-side
+    return fetch("/api/tts"+keyQS,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({text:text,voice:currentVoiceId()})})
+      .then(function(r){ return r.ok?r.blob():null; })
+      .then(function(b){ return b?URL.createObjectURL(b):null; })
+      .catch(function(){ return null; });
+  }
+  function playURL(u){ return new Promise(function(res){ if(!u){res();return;}
+    var a=new Audio(u); activeAudios.push(a);
+    a.onended=function(){URL.revokeObjectURL(u);res();}; a.onerror=function(){res();};
+    a.play().catch(function(){res();}); }); }
+
+  previewBtn.addEventListener("click",function(){
+    var sample="Hi — this is the voice I'll use. The capital of Australia is Canberra.";
+    if(premium()){ fetchPremium(sample).then(function(u){ if(u) playURL(u);
+      else hint.textContent="Premium voice unavailable (check ElevenLabs plan/quota). Browser engine still works."; }); }
+    else { try{ speechSynthesis.cancel(); var u=new SpeechSynthesisUtterance(sample); u.rate=1.02;
+      var v=currentVoice(); if(v){u.voice=v;u.lang=v.lang;} speechSynthesis.speak(u);}catch(e){} }
+  });
+
+  function reset(side){
+    el("clk-"+side).textContent="0.00";
+    el("ans-"+side).textContent="";
+    var st=el("st-"+side); st.textContent="waiting"; st.className="state wait";
+    el("card-"+side).classList.remove("win");
+  }
+
+  // ---- TTS: speak clause-by-clause so the early side starts talking early ----
+  function speaker(side){
+    var buf="", mode=voiceSel.value, on=(mode==="both")||(mode===side);
+    var usePremium=premium(), queue=Promise.resolve();
+    function speakOne(say){ say=(say||"").trim(); if(!on||!say) return;
+      if(usePremium){ var p=fetchPremium(say);              // fire the request immediately
+        queue=queue.then(function(){ return p.then(function(u){
+          if(u) return playURL(u);                          // premium audio, in order
+          try{ var uf=new SpeechSynthesisUtterance(say); uf.rate=1.02; speechSynthesis.speak(uf);}catch(e){} // fall back if premium fails
+        }); }); }
+      else{ try{ var u=new SpeechSynthesisUtterance(say); u.rate=1.02;
+        var v=currentVoice(); if(v){u.voice=v;u.lang=v.lang;} speechSynthesis.speak(u);}catch(e){} }
+    }
+    function flush(force){
+      if(!on){ buf=""; return; }
+      var idx=Math.max(buf.lastIndexOf('.'),buf.lastIndexOf('!'),buf.lastIndexOf('?'));
+      if(!force && idx<0) return;
+      var say=force?buf:buf.slice(0,idx+1); buf=force?"":buf.slice(idx+1);
+      speakOne(say);
+    }
+    return {feed:function(t){ buf+=t; flush(false); }, end:function(){ flush(true); }};
+  }
+
+  function runSide(side, question){
+    reset(side);
+    var clk=el("clk-"+side), st=el("st-"+side), ans=el("ans-"+side);
+    var t0=performance.now(), firstAt=null, raf;
+    st.textContent="thinking…"; st.className="state think";
+    (function tick(){ if(firstAt==null){ clk.textContent=((performance.now()-t0)/1000).toFixed(2);
+      raf=requestAnimationFrame(tick);} })();
+    var spk=speaker(side), text="";
+
+    return fetch("/api/voice",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({side:side,question:question})})
+      .then(function(r){
+        if(!r.ok||!r.body){ return r.json().then(function(j){throw new Error(j.error||("HTTP "+r.status));}); }
+        var reader=r.body.getReader(), dec=new TextDecoder(), acc="";
+        function pump(){ return reader.read().then(function(res){
+          if(res.done){ cancelAnimationFrame(raf); st.textContent="done"; st.className="state talk"; spk.end(); return; }
+          acc+=dec.decode(res.value,{stream:true});
+          var parts=acc.split("\n\n"); acc=parts.pop();
+          parts.forEach(function(block){
+            var line=block.split("\n").find(function(l){return l.indexOf("data:")===0;});
+            if(!line) return;
+            var d=line.slice(5).trim();
+            if(d==="[DONE]"){ return; }
+            var j; try{ j=JSON.parse(d);}catch(e){ return; }
+            if(j.error){ cancelAnimationFrame(raf); st.textContent="error: "+j.error; st.className="state wait"; return; }
+            if(j.t==null) return;
+            if(firstAt==null){ firstAt=performance.now();
+              clk.textContent=((firstAt-t0)/1000).toFixed(2);
+              st.textContent="speaking"; st.className="state talk"; }
+            text+=j.t; ans.textContent=text; spk.feed(j.t);
+          });
+          return pump();
+        });}
+        return pump();
+      })
+      .then(function(){ return firstAt==null?Infinity:(firstAt-t0); })
+      .catch(function(e){ cancelAnimationFrame(raf); st.textContent="error: "+(e.message||e); st.className="state wait"; return Infinity; });
+  }
+
+  function ask(){
+    var question=(q.value||"").trim();
+    if(question.length<3){ hint.textContent="Ask a real question (3+ characters)."; return; }
+    if(busy) return; busy=true; askBtn.disabled=true;
+    try{ speechSynthesis.cancel(); }catch(e){}
+    activeAudios.forEach(function(a){try{a.pause();}catch(e){}}); activeAudios=[];
+    asked.innerHTML="You asked: <b>"+esc(question)+"</b>";
+    hint.textContent="Running both sides…";
+    Promise.all(SIDES.map(function(s){return runSide(s,question);})).then(function(ttfts){
+      busy=false; askBtn.disabled=false;
+      var winner = ttfts[1] < ttfts[0] ? "cerebras" : "baseline";
+      if(isFinite(ttfts[0])&&isFinite(ttfts[1])){
+        el("card-"+winner).classList.add("win");
+        var fast=Math.min(ttfts[0],ttfts[1]), slow=Math.max(ttfts[0],ttfts[1]);
+        hint.textContent="Model compute step: "+(slow/1000).toFixed(2)+"s vs "+(fast/1000).toFixed(2)+"s  ·  "
+          +(slow/fast).toFixed(1)+"× less dead air on the part Cerebras changes (a full voice turn adds STT+TTS on both sides). Ask another.";
+      } else { hint.textContent="Ask another."; }
+    });
+  }
+
+  askBtn.addEventListener("click",ask);
+  q.addEventListener("keydown",function(e){ if(e.key==="Enter") ask(); });
+
+  // ---- optional mic (Web Speech API, Chrome) ----
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition, rec=null, listening=false;
+  if(!SR){ micBtn.disabled=true; micBtn.title="Speech recognition not available in this browser"; }
+  else{
+    micBtn.addEventListener("click",function(){
+      if(listening){ rec&&rec.stop(); return; }
+      rec=new SR(); rec.lang="en-US"; rec.interimResults=false; rec.maxAlternatives=1;
+      rec.onstart=function(){ listening=true; micBtn.classList.add("live"); hint.textContent="Listening… speak now."; };
+      rec.onerror=function(e){ hint.textContent="Mic error: "+e.error+" (type instead)."; };
+      rec.onend=function(){ listening=false; micBtn.classList.remove("live"); };
+      rec.onresult=function(e){ var said=e.results[0][0].transcript; q.value=said; ask(); };
+      try{ rec.start(); }catch(e){ hint.textContent="Couldn't start mic — type instead."; }
+    });
+  }
+
+  // ?q= prefill for screenshots / repeatable takes
+  var pq=new URLSearchParams(location.search).get("q");
+  if(pq){ q.value=pq; ask(); }
+})();
+</script>
+</html>
