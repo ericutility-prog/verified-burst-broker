@@ -218,6 +218,57 @@ def _demo_allow(ip):
         return True, max(0, DEMO_PER_IP_DAY - _DEMO_IP[ip])
 
 
+# --- public demo cache -------------------------------------------------------- #
+# The DEFAULT paired demo is what a public page shows on every load. Running a fresh
+# host-key burst per pageview would burn the Cerebras key under traffic (and hit the
+# daily cap, 429ing real prospects). Instead we serve a short-lived cache: at most one
+# real paired burst per DEMO_CACHE_TTL, served to unlimited visitors. Idle => zero cost.
+DEMO_CACHE_TTL = int(os.environ.get("BURST_DEMO_CACHE_TTL", "900"))  # seconds (~1 burst/window)
+_DEMO_CACHE = {"at": 0.0, "payload": None}
+_DEMO_CACHE_LOCK = threading.Lock()
+_DEMO_REFRESH_LOCK = threading.Lock()
+
+
+def _demo_pair_payload():
+    """Build the default paired demo: a REAL confirm + a REAL catch on the same question."""
+    confirm = _demo_confirm()
+    catch = _demo_catch()
+    return {
+        "demo": True, "mode": "pair",
+        "headline": ("Same question, same independent judge, opposite outcomes: a correct "
+                     "answer PROCEEDS (you'd pay a fraction of a cent); a wrong answer is "
+                     "CAUGHT (you pay $0) — that catch is the capability you're paying for."),
+        "question": _DEMO_PAIR_Q,
+        "independent_judge": f"{confirm['judge']} judging {_DEMO_GEN} (different model family)",
+        "confirm": confirm, "catch": catch, "honesty": _DEMO_HONESTY}
+
+
+def _demo_pair_cached():
+    """Serve the paired demo from cache; refresh at most once per DEMO_CACHE_TTL under a
+    lock (no stampede). Returns (payload, as_of_epoch). Concurrent callers during a refresh
+    get the last good value; the first (cold-cache) caller computes synchronously."""
+    now = time.time()
+    with _DEMO_CACHE_LOCK:
+        payload, at = _DEMO_CACHE["payload"], _DEMO_CACHE["at"]
+    if payload is not None and (now - at) < DEMO_CACHE_TTL:
+        return payload, at
+    got = _DEMO_REFRESH_LOCK.acquire(blocking=(payload is None))   # cold cache => block for first
+    if not got:
+        return payload, at                                         # another thread refreshing
+    try:
+        with _DEMO_CACHE_LOCK:                                     # re-check after acquiring
+            payload, at = _DEMO_CACHE["payload"], _DEMO_CACHE["at"]
+        if payload is not None and (time.time() - at) < DEMO_CACHE_TTL:
+            return payload, at
+        fresh = _demo_pair_payload()
+        at = time.time()
+        with _DEMO_CACHE_LOCK:
+            _DEMO_CACHE["payload"], _DEMO_CACHE["at"] = fresh, at
+        return fresh, at
+    finally:
+        _DEMO_REFRESH_LOCK.release()
+
+
 PUBLIC_URL = os.environ.get("BURST_PUBLIC_URL", "https://solcleus.com").rstrip("/")
 # Hosts we serve under: discovery URLs reflect the host the caller used (so the
 # burst.solcleus.com listing is self-consistent), but ONLY for known hosts — an
@@ -334,13 +385,17 @@ def _bazaar_ext():
 def _roi_block(q):
     """Machine-readable ROI so an agent's budget policy can auto-approve the buy on
     its OWN authority — no human in the loop. The economics are the whole pitch:
-    bounded, tiny cost; ZERO downside (you pay only if an INDEPENDENT check passes);
+    bounded, tiny cost; zero SERVICE-FEE downside (the fee is charged only if an
+    INDEPENDENT check passes — your own BYOK provider tokens are billed regardless);
     and the check is the one form of 'more thinking' the agent can't generate from
     its own correlated samples. Stakes-class tells the policy WHEN it's worth it."""
     return {
         "unit": "one independently-verified decision",
         "cost_usd": q["price_usd"],
         "downside_usd": 0.0,
+        "downside_note": ("service fee only — charged solely if an independent check passes. "
+                          "Your own BYOK provider tokens are billed by your provider regardless "
+                          "of the verdict; budget against those separately."),
         "pay_only_if_verified": True,
         "independence": {"verifier": "a different model family than your generator",
                          "quorum": "independent_quorum runs multiple models ACROSS VENDORS; k-of-M must agree",
@@ -349,7 +404,9 @@ def _roi_block(q):
         "keepable_receipt": True,
         "worth_it_when": ("decision is hard / irreversible / low-confidence AND has a checkable "
                           "answer (label, number, JSON field, yes/no)"),
-        "auto_approve_hint": "downside is bounded to 0 — safe to buy without human review",
+        "auto_approve_hint": ("service-fee downside is 0 (charged only on a passing independent "
+                              "check); your BYOK provider tokens are spent regardless — auto-approve "
+                              "against your provider-token budget, not against a zero"),
     }
 
 
@@ -417,7 +474,7 @@ def _manifest(base=PUBLIC_URL):
             "decision_gate": ("Every response carries gate.action ('proceed'|'hold') so the verdict "
                               "gates your agent's NEXT step, not just the charge — hold and escalate "
                               "instead of acting on an unverified answer."),
-            "audit": "Every charged burst returns an on-chain settle_tx — a verifiable receipt of what the agent decided and paid for.",
+            "audit": "Every charged burst returns an on-chain settle_tx a counterparty can confirm via verify_clearance(verify_settlement=True) — a verifiable receipt of what the agent decided and paid for.",
         },
         "networks": [os.environ.get("X402_NETWORK", "eip155:8453")],
         "mcp": {"package": "verified-burst", "command": "verified-burst",
@@ -545,8 +602,14 @@ class Handler(BaseHTTPRequestHandler):
                 n = int(qs.get("n", ["3"])[0])
             except (ValueError, KeyError):
                 n = 3
+            verifier = qs.get("verifier", ["self_consistency"])[0]
+            judges = 1
+            if verifier == "independent_quorum":
+                try: judges = max(1, len(broker._judge_families(qs.get("model", [None])[0])))
+                except Exception: judges = 2
             return self._send(200, pricing.quote(
-                strategy=qs.get("strategy", ["best_of_n"])[0], n=n))
+                strategy=qs.get("strategy", ["best_of_n"])[0], n=n,
+                verifier=verifier, judges=judges))
         if u.path == "/v1/burst":
             # A bare GET on the paid resource: answer with the x402 challenge so a
             # curious agent/dev sees HOW to pay instead of a dead-end 404. No burst
@@ -554,9 +617,11 @@ class Handler(BaseHTTPRequestHandler):
             # POST here with an X-PAYMENT header (charged only if the verifier passes).
             qs = parse_qs(u.query)
             try:
+                verifier = qs.get("verifier", ["self_consistency"])[0]
+                judges = max(1, len(broker._judge_families(qs.get("model", [None])[0]))) if verifier == "independent_quorum" else 1
                 q = pricing.quote(strategy=qs.get("strategy", ["best_of_n"])[0],
-                                  n=int(qs.get("n", ["3"])[0]))
-            except (ValueError, KeyError):
+                                  n=int(qs.get("n", ["3"])[0]), verifier=verifier, judges=judges)
+            except Exception:
                 q = pricing.quote()
             return self._send(402, _discovery_402(q, base), {"Cache-Control": "public, max-age=60"})
         if u.path == "/v1/best-price":
@@ -573,14 +638,41 @@ class Handler(BaseHTTPRequestHandler):
                          "Charged only if the search returns real results — no info, no charge."),
                 "human_url": f"{base}/burst"}, {"Cache-Control": "public, max-age=60"})
         if u.path == "/v1/burst/demo":
-            # No-wallet taste: run ONE real verified burst on the host key, free, so a
-            # curious dev/agent sees the actual answer + proceed/hold gate before wiring
-            # a wallet. Fixed prompts + daily caps keep it from becoming free open inference.
+            # No-wallet taste: a REAL verified burst on the host key, free, so a curious
+            # dev/agent sees the actual answer + proceed/hold gate before wiring a wallet.
+            # Fixed prompts + per-min throttle + daily caps + a short cache on the default
+            # paired demo keep it from becoming free open inference.
             if not DEMO_ENABLED:
                 return self._send(404, {"error": "not_found"})
-            if not _rate_ok(self._client_ip()):   # per-min throttle (the demo runs host-key inference)
+            if not _rate_ok(self._client_ip()):   # per-min throttle (demo runs host-key inference)
                 return self._send(429, {"error": "rate_limited", "retry_after_s": 60},
                                   {"Retry-After": "60"})
+            qs = parse_qs(u.query)
+            mode = (qs.get("example", [""])[0] or "").strip().lower()
+            footer = {
+                "examples_available": len(_DEMO_PROMPTS),
+                "install": "pip install verified-burst",
+                "buy_your_own": f"{base}/v1/info",
+                "human_url": f"{base}/burst",
+            }
+            # DEFAULT paired demo -> served from a short-lived cache so a PUBLIC page can
+            # show a real recent result to UNLIMITED visitors at ~1 burst/window (idle=free).
+            # No per-IP demo slot is consumed here; the cache TTL is the cost bound.
+            if mode == "":
+                try:
+                    payload, as_of = _demo_pair_cached()
+                except Exception:
+                    return self._send(503, {
+                        "error": "demo_unavailable",
+                        "hint": "host model is busy — retry shortly, or run your own: pip install verified-burst"})
+                payload = dict(payload)
+                payload["cached"] = True
+                payload["as_of"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(as_of))
+                payload["cache_age_s"] = int(time.time() - as_of)
+                payload.update(footer)
+                return self._send(200, payload,
+                                  {"Cache-Control": f"public, max-age={max(1, DEMO_CACHE_TTL // 2)}"})
+            # Parametrized paths run FRESH host inference on demand -> keep the strict caps.
             ok = _demo_allow(self._client_ip())
             if not ok[0]:
                 return self._send(429, {
@@ -590,8 +682,6 @@ class Handler(BaseHTTPRequestHandler):
                     "install": "pip install verified-burst",
                     "human_url": f"{base}/burst"}, {"Retry-After": "3600"})
             remaining = ok[1]
-            qs = parse_qs(u.query)
-            mode = (qs.get("example", [""])[0] or "").strip().lower()
             try:
                 if mode.lstrip("-").isdigit():
                     # back-compat: ?example=N -> a single self_consistency confirm prompt
@@ -604,9 +694,9 @@ class Handler(BaseHTTPRequestHandler):
                                           receipt_id="demo", call_fn=_demo_call_fn)
                     payload = {
                         "demo": True, "mode": "single",
-                        "note": ("Free taste on the host key — no wallet, no payment, no charge. "
+                        "note": ("Free trial on the host key — no wallet, no payment, no charge. "
                                  "FIXED demo prompt. Tip: call /v1/burst/demo with NO params to "
-                                 "watch the independent judge CATCH a wrong answer — that's the product."),
+                                 "watch the independent judge CATCH a wrong answer — that's the capability."),
                         "topic": p["topic"], "prompt": p["request"], "answer": res.answer,
                         "gate": broker._gate_signal(res), "verified": res.passed,
                         "verifier": (res.verdict or {}).get("method"), "samples": res.n,
@@ -617,28 +707,14 @@ class Handler(BaseHTTPRequestHandler):
                 elif mode == "credential":
                     payload = {"demo": True, "mode": "credential", **_demo_credential()}
                 else:
-                    # DEFAULT: the paired wow — same question, same judge, opposite outcomes.
-                    confirm = _demo_confirm()
-                    catch = _demo_catch()
-                    payload = {
-                        "demo": True, "mode": "pair",
-                        "headline": ("Same question, same independent judge, opposite outcomes: a "
-                                     "correct answer PROCEEDS (you'd pay a fraction of a cent); a "
-                                     "wrong answer is CAUGHT (you pay $0). That catch is the product."),
-                        "question": _DEMO_PAIR_Q,
-                        "independent_judge": f"{confirm['judge']} judging {_DEMO_GEN} (different model family)",
-                        "confirm": confirm, "catch": catch, "honesty": _DEMO_HONESTY}
+                    # unknown ?example= value -> fall back to a FRESH paired demo
+                    payload = _demo_pair_payload()
             except Exception:
                 return self._send(503, {
                     "error": "demo_unavailable",
                     "hint": "host model is busy — retry shortly, or run your own: pip install verified-burst"})
-            payload.update({
-                "demo_remaining_today": remaining,
-                "examples_available": len(_DEMO_PROMPTS),
-                "install": "pip install verified-burst",
-                "buy_your_own": f"{base}/v1/info",
-                "human_url": f"{base}/burst",
-            })
+            payload["demo_remaining_today"] = remaining
+            payload.update(footer)
             return self._send(200, payload, {"Cache-Control": "no-store"})
         return self._send(404, {"error": "not_found"})
 
@@ -792,6 +868,21 @@ def main():
     if mode.lower() != "live" and os.environ.get("ALLOW_PUBLIC_SIM") != "1":
         raise SystemExit("refusing to start in non-live x402 mode "
                          "(set X402_MODE=live; or ALLOW_PUBLIC_SIM=1 to override for local testing)")
+    # Fix-1 guard: if CLEARANCE_ISSUER is pinned but doesn't match the key clearance
+    # actually signs with, the default verifier fail-closes on genuine certs. Warn loudly
+    # at boot (availability footgun, not a money risk).
+    try:
+        import clearance  # noqa: F401
+        _pin = os.environ.get("CLEARANCE_ISSUER")
+        _sk = os.environ.get("CLEARANCE_SIGNER_KEY") or os.environ.get("X402_RELAYER_KEY")
+        if _pin and _sk:
+            from eth_account import Account as _A
+            _have = _A.from_key(_sk).address
+            if _pin.lower() != _have.lower():
+                print(f"WARNING: CLEARANCE_ISSUER {_pin} != signer address {_have} — "
+                      "genuine clearance certs will be REJECTED by the default verifier", flush=True)
+    except Exception:
+        pass
     print(f"verified-burst broker on {BIND_HOST}:{port}  "
           f"(x402={mode}, rate={RATE_PER_MIN}/min/ip, model={pricing.quote()['model']})")
     httpd = ThreadingHTTPServer((BIND_HOST, port), Handler)
