@@ -168,18 +168,22 @@ def _():
 # ---------------------------------------------------------------------------
 @check("caller answer_key regex can't ReDoS a worker", "input", "high")
 def _():
-    # Run the extractor in a KILLABLE subprocess: a true catastrophic backtrack
-    # can't be interrupted in-thread (stdlib `re` is C-level), so an in-thread
-    # timeout would just leak a spinning thread. subprocess.run kills on timeout.
+    # Black-box: run the extractor in a KILLABLE subprocess and confirm it returns fast for
+    # the WHOLE catastrophic-backtracking family — grouped (a+)+$, UNGROUPED a+a+…$ (which a
+    # ")[*+?{]" screen misses), quantified alternation, and bounded repetition. _extract now
+    # runs the caller regex under the `regex` module's hard timeout, so these are interrupted
+    # instead of wedging a worker.
     import subprocess
-    code = ("import burst; burst._extract('a'*60+'!', ('regex','(a+)+$'))")
+    bombs = ["(a+)+$", "a+" * 25 + "$", "(a|a)+$", "(.*a){20}$"]
+    code = "import burst\n" + "\n".join(
+        "burst._extract('a'*80+'!', ('regex', %r))" % b for b in bombs)
     try:
         subprocess.run([sys.executable, "-c", code], cwd=os.path.dirname(__file__),
-                       timeout=2.0, capture_output=True)
-        return True, "catastrophic pattern (a+)+$ neutralized (returned fast)"
+                       timeout=3.0, capture_output=True)
+        return True, "catastrophic patterns (grouped + ungrouped + alternation) neutralized (returned fast)"
     except subprocess.TimeoutExpired:
-        return False, ("(a+)+$ on 60 chars ran >2s — a caller-supplied answer_key "
-                       "regex can wedge a worker thread (catastrophic backtracking)")
+        return False, ("a caller-supplied answer_key regex wedged a worker thread >3s "
+                       "(catastrophic backtracking not interrupted)")
 
 
 @check("oversized regex is rejected, normal regex still works", "input", "med")
@@ -216,6 +220,54 @@ def _():
           and 'ALLOW_PUBLIC_SIM' in src
           and 'mode.lower() != "live"' in src)
     return ok, "live-only boot guard present (sim requires ALLOW_PUBLIC_SIM)"
+
+
+@check("SIM facilitator refuses to authorize without ALLOW_PUBLIC_SIM", "money", "med")
+def _():
+    import os as _os
+    from x402_gate import Facilitator
+    saved = _os.environ.pop("ALLOW_PUBLIC_SIM", None)
+    try:
+        f = Facilitator()                      # sim (no facilitator URL configured)
+        v = f.verify("anypayload", {"accepts": [{}]})
+        s = f.settle("anypayload", {"accepts": [{}]})
+        return (not v["valid"]) and (not s["success"]), \
+            f"sim verify.valid={v['valid']} settle.success={s['success']} sans ALLOW_PUBLIC_SIM (want both False)"
+    finally:
+        if saved is not None:
+            _os.environ["ALLOW_PUBLIC_SIM"] = saved
+
+
+@check("settlement is confirmed on-chain before charging (facilitator can't lie)", "money", "high")
+def _():
+    import clearance
+    class _LyingFac(_OKFac):
+        def settle(self, xp, reqs):
+            return {"success": True, "tx": "0x" + "cd" * 32, "mode": "real"}
+    saved_fetch, saved_payto = clearance._default_receipt_fetch, os.environ.get("X402_PAY_TO")
+    os.environ["X402_PAY_TO"] = "0x0000000000000000000000000000000000005e11"
+    try:
+        ledger.reset_all()
+        clearance._default_receipt_fetch = lambda tx: {"status": 0, "logs": []}       # chain: REVERTED
+        r = broker.serve_burst("decide", x_payment="sim", verifier="judge", provider_key="byok",
+                               call_fn=_pass, facilitator=_LyingFac("0xw"), budget_cap=1.0)
+        withheld = r["status"] != "ok" and not r.get("charged")
+        ledger.reset_all()
+        usdc, pt = clearance._USDC[clearance._network()], os.environ["X402_PAY_TO"]
+        clearance._default_receipt_fetch = lambda tx: {"status": 1, "logs": [{"address": usdc,
+            "topics": [clearance._TRANSFER_TOPIC, "0x" + "00" * 12 + pt[2:], "0x" + "00" * 12 + pt[2:]],
+            "data": hex(10 ** 9)}]}                                                    # chain: real USDC to seller
+        r2 = broker.serve_burst("decide", x_payment="sim", verifier="judge", provider_key="byok",
+                                call_fn=_pass, facilitator=_LyingFac("0xw2"), budget_cap=1.0)
+        confirmed = r2["status"] == "ok" and r2.get("charged") is True
+        return withheld and confirmed, f"reverted_withheld={withheld} confirmed_charged={confirmed}"
+    finally:
+        clearance._default_receipt_fetch = saved_fetch
+        if saved_payto is None:
+            os.environ.pop("X402_PAY_TO", None)
+        else:
+            os.environ["X402_PAY_TO"] = saved_payto
+        ledger.reset_all()
 
 
 # ---------------------------------------------------------------------------

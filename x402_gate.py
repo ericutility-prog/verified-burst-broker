@@ -77,6 +77,14 @@ class Facilitator:
         if not x_payment:
             return {"valid": False, "reason": "no X-PAYMENT", "mode": "sim" if self.sim else "real"}
         if self.sim:
+            # Defense in depth: the SIM facilitator authorizes ANY decodable payload (no real
+            # signature check), so it must NEVER authorize on a network-reachable/production
+            # process. Refuse unless sim is explicitly enabled for local testing
+            # (ALLOW_PUBLIC_SIM=1 — the same gate the server boot check requires). In prod the
+            # LIVE facilitator is used; even a stray X402_MODE flip can't make sim authorize.
+            if os.environ.get("ALLOW_PUBLIC_SIM") != "1":
+                return {"valid": False, "mode": "sim", "payer": "",
+                        "reason": "sim facilitator disabled (set ALLOW_PUBLIC_SIM=1 for local testing only)"}
             p = self._decode(x_payment)
             ok = bool(p) and "from" in p
             return {"valid": ok, "reason": "sim-ok" if ok else "sim-bad-payload",
@@ -89,6 +97,9 @@ class Facilitator:
     def settle(self, x_payment, requirements):
         """Capture / broadcast the held authorization. Call ONLY when verified-adequate."""
         if self.sim:
+            if os.environ.get("ALLOW_PUBLIC_SIM") != "1":     # sim never captures on a non-test process
+                return {"success": False, "tx": "", "mode": "sim",
+                        "reason": "sim facilitator disabled (set ALLOW_PUBLIC_SIM=1 for local testing only)"}
             p = self._decode(x_payment) or {}
             payer = p.get("from", "sim-payer")
             return {"success": True, "tx": "sim-tx-" + payer[-6:], "mode": "sim"}

@@ -75,7 +75,10 @@ def serve_search(query, *, x_payment=None, budget_cap=broker.DEFAULT_BUDGET_USD,
         return {"status": "payment_already_used", "payer": payer,
                 "hint": "this x402 authorization was already used — sign a fresh payment per search"}
 
-    if q["price_usd"] > broker.remaining_budget(payer, budget_cap):
+    # governor: atomically HOLD the fee up front (check-and-reserve in one txn), same as
+    # the burst path — so two concurrent searches from one wallet can't both clear the
+    # check near the cap boundary and both settle. Released on any non-charge exit below.
+    if not ledger.reserve(payer, q["price_usd"], budget_cap):
         return {"status": "budget_exceeded", "payer": payer,
                 "remaining_usd": round(broker.remaining_budget(payer, budget_cap), 6),
                 "price_usd": q["price_usd"]}
@@ -84,12 +87,14 @@ def serve_search(query, *, x_payment=None, budget_cap=broker.DEFAULT_BUDGET_USD,
     try:
         result = _search(query)
     except Exception as e:
+        ledger.release(payer, q["price_usd"])   # search blew up -> free the hold, no charge
         return {"status": "search_failed", "charged": False, "price_usd": 0.0,
                 "query": query, "error": str(e), "payer": payer}
 
     deals = result.get("deals") or []
     if not deals:
         # honest: no info found -> no charge (authorization discarded)
+        ledger.release(payer, q["price_usd"])   # nothing to sell -> free the hold
         return {"status": "no_results", "charged": False, "price_usd": 0.0,
                 "query": query, "source": result.get("source"), "payer": payer,
                 "remaining_budget_usd": round(broker.remaining_budget(payer, budget_cap), 6)}
@@ -100,6 +105,7 @@ def serve_search(query, *, x_payment=None, budget_cap=broker.DEFAULT_BUDGET_USD,
     except Exception:
         s = {"success": False}
     if not s["success"]:
+        ledger.release(payer, q["price_usd"])   # capture didn't confirm -> free the hold
         return {"status": "settle_failed", "charged": False, "price_usd": 0.0,
                 "query": query, "payer": payer,
                 "hint": ("payment capture did not confirm — results withheld and you were "

@@ -44,6 +44,19 @@ _conn.executescript(
         day  INTEGER NOT NULL,
         used INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS global_trial (
+        id   INTEGER PRIMARY KEY CHECK (id = 1),
+        day  INTEGER NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS pending_settle (
+        nonce  TEXT PRIMARY KEY,   -- x402 authorization dedup key
+        payer  TEXT NOT NULL,
+        amount REAL NOT NULL,      -- held fee (money MAY have moved on-chain)
+        tx     TEXT,               -- broadcast tx hash if surfaced (often empty)
+        reason TEXT,               -- the settle failure reason (why it's ambiguous)
+        ts     REAL NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS seen_nonce (
         k  TEXT PRIMARY KEY,   -- dedup key for a signed x402 authorization
         ts REAL NOT NULL       -- when first claimed (for optional pruning)
@@ -177,6 +190,29 @@ def global_judge_reserve(judges: int, daily_cap: int) -> bool:
         return True
 
 
+def global_trial_reserve(bursts: int, daily_cap: int) -> bool:
+    """Reserve `bursts` free-trial host-key bursts against today's global pool for
+    UNPROVEN wallets. This is the Sybil-rotation cap for the self_consistency trial
+    path (the per-wallet trial_cap alone can be defeated by rotating wallets, since a
+    failed trial burst never settles, so its USDC is never spent and recycles). Atomic
+    check-and-reserve with a UTC-day rollover; returns False once the day's pool is
+    exhausted. Separate pool from global_judge so trial and judge budgets don't share."""
+    day = int(time.time() // 86400)
+    with _LOCK, _conn:
+        row = _conn.execute("SELECT day, used FROM global_trial WHERE id=1").fetchone()
+        if not row or row[0] != day:
+            _conn.execute(
+                "INSERT INTO global_trial(id, day, used) VALUES(1, ?, 0) "
+                "ON CONFLICT(id) DO UPDATE SET day = excluded.day, used = 0", (day,))
+            used = 0
+        else:
+            used = int(row[1])
+        if used + bursts > daily_cap:
+            return False
+        _conn.execute("UPDATE global_trial SET used = used + ? WHERE id=1", (bursts,))
+        return True
+
+
 # --- single-use payment authorizations -------------------------------------- #
 def claim_nonce(key: str) -> bool:
     """Atomically record a signed-payment dedup key as USED. Returns True if newly
@@ -197,6 +233,7 @@ def reset_all() -> None:
     with _LOCK, _conn:
         _conn.execute("DELETE FROM ledger")
         _conn.execute("DELETE FROM global_judge")
+        _conn.execute("DELETE FROM global_trial")
         _conn.execute("DELETE FROM seen_nonce")
 
 
