@@ -348,7 +348,7 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
 
     # 2b) anti-abuse for the broker-paid judges (independent_judge + independent_quorum
     #     are the only paths that spend OUR tokens).
-    if verifier in ("independent_judge", "independent_quorum"):
+    if verifier in ("independent_judge", "independent_quorum", "tiered"):
         # Rule 1: never run the broker-paid judge on the host key. BYOK-only means a
         # miss costs us at most the judge call(s), never the buyer's generation. WAIVED
         # when a candidate is supplied (no generation happens — nothing to BYOK).
@@ -395,18 +395,23 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     #    buyer's answer (the part an agent can't self-supply). Skip when a test
     #    injects its own call_fn (sim) — there's no real provider to judge on.
     try:
-        verify_fn = verifier_model = verify_fns = None
+        verify_fn = verifier_model = verify_fns = reasoning_fn = reasoning_model = None
         if call_fn is None:
             if verifier == "independent_judge":
                 verify_fn, verifier_model = _independent_verify_fn(model)
             elif verifier == "independent_quorum":
                 verify_fns = _independent_verify_fns(model)        # M distinct families
+            elif verifier == "tiered":
+                import tiered                                       # SPEC-tiered-verifier-v1
+                verify_fns = tiered.fast_judges(model)             # fast rung (diff families)
+                reasoning_fn, reasoning_model = tiered.reasoning_judge()   # escalation rung
         res = burst_mod.run_burst(request, strategy=strategy, n=n, verifier=verifier,
                                   answer_key=answer_key, check=check,
                                   receipt_id=receipt_id, call_fn=call_fn,
                                   provider_key=provider_key, model=model,
                                   verify_fn=verify_fn, verifier_model=verifier_model,
-                                  candidate=candidate, verify_fns=verify_fns, quorum_k=quorum_k)
+                                  candidate=candidate, verify_fns=verify_fns, quorum_k=quorum_k,
+                                  reasoning_fn=reasoning_fn, reasoning_model=reasoning_model)
     except Exception:
         ledger.release(payer, q["price_usd"])   # burst blew up -> nothing charged, free the hold
         raise
@@ -418,7 +423,7 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     # 5) settle ONLY if the verifier passed — else discard the authorization (no charge)
     if not res.passed:
         ledger.release(payer, q["price_usd"])   # miss -> free the hold, no charge
-        if verifier in ("independent_judge", "independent_quorum"):  # count toward abuse breaker
+        if verifier in ("independent_judge", "independent_quorum", "tiered"):  # count toward abuse breaker
             ledger.record_miss(payer)
         return {"status": "not_verified", "charged": False, "price_usd": 0.0,
                 "gate": _gate_signal(res),               # action=hold — don't act on this answer

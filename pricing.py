@@ -31,6 +31,11 @@ def _verify_fee(verifier, judges=1):
     if verifier == "independent_quorum":
         # k-of-M consensus: we run (and pay for) M independent judges.
         return FEES["verify_independent"] * max(1, judges)
+    if verifier == "tiered":
+        # tiered = one reasoning-backed independent verdict from the buyer's view; the
+        # fast->reasoning escalation cost is ours to absorb. Priced as the auto tier;
+        # set FEES["verify_tiered"] to charge a premium.
+        return FEES.get("verify_tiered", FEES["verify_independent"])
     return FEES["verify"]
 
 

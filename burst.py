@@ -105,10 +105,18 @@ def verify_judge(candidate_text, request, call_fn, *, method="judge", meta=None)
     check is decorrelated from the answer's own blind spots — the one form of 'more
     thinking' an agent cannot self-supply from its own correlated samples. `meta`
     carries that independence record (generator vs verifier model) for the receipt."""
-    prompt = (f"You are a strict adversarial verifier. TASK:\n{request}\n\nCANDIDATE ANSWER:\n"
-              f"{candidate_text}\n\nIs the candidate correct AND fully responsive? "
-              'Reply JSON {"adequate": true|false, "reason": "<short>"} only. '
-              "Default to false if you are not sure.")
+    prompt = (f"You are a strict adversarial verifier. Decide whether the CANDIDATE ANSWER is "
+              f"substantively correct and fully responsive to the TASK.\n\nTASK:\n{request}\n\n"
+              f"CANDIDATE ANSWER:\n{candidate_text}\n\nJudge SUBSTANCE, not presentation:\n"
+              "- Ignore case, whitespace, punctuation, thousands separators and equivalent "
+              'formatting. "70b12" equals "70B12"; "1,234" equals "1234"; "Friday" equals '
+              '"friday". A numerically or semantically equal answer IS adequate.\n'
+              "- If the task needs computation, verify it carefully; if you get a different "
+              "value, re-check your OWN work before concluding the candidate is wrong.\n"
+              "- Mark false only for a genuine SUBSTANTIVE error or non-responsiveness, never "
+              "for formatting alone. If after careful checking you are still unsure the substance "
+              "is correct, default to false.\n\n"
+              'Reply with JSON only: {"adequate": true|false, "reason": "<short>"}')
     r = call_fn([{"role": "user", "content": prompt}])
     v = _extract(r["text"], ("json", "adequate"))
     verdict = {"method": method, "adequate": v in ("true", "1", "yes"),
@@ -122,7 +130,9 @@ def verify_judge(candidate_text, request, call_fn, *, method="judge", meta=None)
 def run_burst(request, *, strategy="best_of_n", n=3, verifier="self_consistency",
               answer_key=None, check=None, receipt_id="sim", call_fn=None,
               provider_key=None, model=None, verify_fn=None, verifier_model=None,
-              candidate=None, verify_fns=None, quorum_k=None):
+              candidate=None, verify_fns=None, quorum_k=None,
+              reasoning_fn=None, reasoning_model=None, human_gate=None,
+              tiered_escalate=None):
     if candidate is not None:
         # Caller ALREADY has an answer (e.g. their agent's own decision) — judge THAT
         # instead of generating. No generation tokens spend; the independent judge
@@ -211,6 +221,17 @@ def run_burst(request, *, strategy="best_of_n", n=3, verifier="self_consistency"
         verdict = {"method": "independent_quorum", "adequate": (m > 0 and yes >= k),
                    "k": k, "m": m, "votes_for": yes, "independent": m >= 1,
                    "generator_model": model, "votes": votes}
+    elif verifier == "tiered":
+        # Tiered escalation ladder (SPEC-tiered-verifier-v1.md) — delegates to the
+        # isolated tiered module (lazy import avoids a load-time cycle). The fast rung
+        # judges arrive via verify_fns; the reasoning rung via reasoning_fn/_model.
+        import tiered
+        answer = candidates[0]["text"]
+        reasoning = (reasoning_fn, reasoning_model) if reasoning_fn else None
+        verdict = tiered.verify(answer, request,
+                                fast_fns=list(verify_fns) if verify_fns else None,
+                                reasoning=reasoning, human_gate=human_gate,
+                                escalate=tiered_escalate, generator_model=model)
     else:
         answer, verdict = verify_self_consistency(candidates, answer_key)
 

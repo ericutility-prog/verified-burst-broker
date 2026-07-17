@@ -24,3 +24,6 @@ proof_results.json
 .outside_watch_state.json
 outside_watch.log
 outside_watch.latest.txt
+
+# session backups
+*.bak-*
