@@ -4,7 +4,9 @@
   * REPLAY: the cert does NOT clear a different action (content binding);
   * FORGERY: tampering the cert, or a wrong trusted issuer, fails the signature check;
   * a non-independent decision is never `cleared`;
-  * REVOCATION: a target on the verified-flag commons fails clearance.
+  * REVOCATION: a target on the verified-flag commons fails clearance;
+  * SETTLEMENT: verify_settlement=True requires settle_tx to have paid USDC to the seller
+    on-chain — placeholder/reverted/wrong-payee/underpaid/missing all fail (mocked receipt).
 """
 import os, tempfile
 os.environ.setdefault("FLAGSTORE_DB", os.path.join(tempfile.gettempdir(), "vb_test_clearance_flags.db"))
@@ -69,8 +71,39 @@ def main():
     assert v["cleared"] is True, v
     flagstore.reset_all()
 
+    # 6) SETTLEMENT (opt-in) — settle_tx must have moved USDC to the seller on-chain.
+    PAY_TO = "0x0000000000000000000000000000000000005e11"
+    OTHER = "0x000000000000000000000000000000000000beef"
+    TXOK = "0x" + "ab" * 32                       # a valid-shaped tx hash
+    SETTLED = {"answer": "Paris", "tx": TXOK,
+               "receipt": {"verified": True, "independent": True, "verifier_model": "zai-glm-4.7",
+                           "generator_model": "gpt-oss-120b", "answer": "Paris", "settle_tx": TXOK}}
+    scert = clearance.sign_clearance(REQ, SETTLED)
+    usdc = clearance._USDC[clearance._network()]
+    def _tt(addr): return "0x" + "00" * 12 + addr[2:]
+    def receipt(status, to_addr, amount_usd):
+        return {"status": status, "logs": [{"address": usdc,
+                "topics": [clearance._TRANSFER_TOPIC, _tt(PAY_TO), _tt(to_addr)],
+                "data": hex(int(amount_usd * 1_000_000))}]}
+    def V(**kw):
+        return clearance.verify_clearance(scert, REQ, trusted_issuer=scert["issuer"],
+                                          verify_settlement=True, pay_to=PAY_TO, **kw)
+    assert V(min_amount_usd=0.004, _receipt_fetch=lambda tx: receipt(1, PAY_TO, 0.004))["cleared"] is True
+    v = clearance.verify_clearance(cert, REQ, trusted_issuer=issuer, verify_settlement=True,
+                                   pay_to=PAY_TO, _receipt_fetch=lambda tx: receipt(1, PAY_TO, 1))
+    assert v["cleared"] is False and any("valid on-chain tx hash" in r for r in v["reasons"]), v
+    v = V(_receipt_fetch=lambda tx: receipt(0, PAY_TO, 0.004))
+    assert v["cleared"] is False and any("reverted" in r for r in v["reasons"]), v
+    v = V(_receipt_fetch=lambda tx: receipt(1, OTHER, 0.004))
+    assert v["cleared"] is False and any("no USDC" in r for r in v["reasons"]), v
+    v = V(min_amount_usd=1.00, _receipt_fetch=lambda tx: receipt(1, PAY_TO, 0.004))
+    assert v["cleared"] is False and any("want >=" in r for r in v["reasons"]), v
+    v = V(_receipt_fetch=lambda tx: None)
+    assert v["cleared"] is False and any("no reachable on-chain receipt" in r for r in v["reasons"]), v
+    print("[settle] on-chain settlement: confirmed OK; placeholder/reverted/wrong-payee/underpaid/missing all rejected")
+
     print("\nCLEARANCE OK — content-bound (no replay), signed (no forgery), independence-gated, "
-          "revocable via the flag commons.")
+          "revocable via the flag commons, settlement verifiable on-chain.")
 
 
 if __name__ == "__main__":
