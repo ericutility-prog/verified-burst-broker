@@ -1,7 +1,7 @@
 # verified-burst
 
 An MCP tool that lets your agent **buy verified inference at hard decisions and
-pay only if the answer is correct.** At an irreversible/ambiguous/deadline fork,
+pay only if an independent verifier confirms the answer.** At an irreversible/ambiguous/deadline fork,
 your agent escalates to fast silicon, samples best-of-N, runs the answers through
 a verifier, and pays a few tenths of a cent over x402 — **charged only if it
 passes.** Non-verified results cost nothing. Budget-capped, BYOK.

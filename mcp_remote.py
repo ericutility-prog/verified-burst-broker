@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""THE DISTRIBUTABLE WEDGE — a thin MCP server an agent-builder installs.
+"""verified-burst — a thin MCP server an agent-builder installs (talks to the hosted burst endpoint over x402; BYOK optional).
 
 Unlike mcp_server.py (which runs the broker in-process and needs the SELLER's
 secrets), this is a pure CLIENT: it talks to the hosted verified-burst endpoint
@@ -48,9 +48,11 @@ TOOL = {
     "description": (
         "Buy a verified decision at a hard/irreversible/low-confidence fork — best when the answer "
         "is checkable (a label, number, JSON field, or yes/no). Samples best-of-N on your own key, "
-        "gates the answer through a verifier (samples agree / judge / your check), and pays the "
-        "service fee (x402 stablecoin) ONLY if it passes — a miss waives the fee (your BYOK tokens "
-        "still apply). Returns the passing answer + receipt. Use when getting it wrong is costly."),
+        "then gates the answer through a verifier — up to an INDEPENDENT model family (a different "
+        "vendor) that checks it, the one form of 'more thinking' your own correlated samples can't "
+        "supply — and pays the service fee (x402 stablecoin) ONLY if it passes; a miss waives the "
+        "fee (your BYOK tokens still apply). Returns the passing answer + a keepable receipt. Use "
+        "when getting it wrong is costly."),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -58,14 +60,27 @@ TOOL = {
                         "when the answer is checkable — a label, number, JSON field, or yes/no."},
             "strategy": {"type": "string", "enum": ["fast", "best_of_n"], "default": "best_of_n"},
             "n": {"type": "integer", "default": 3, "description": "best-of-N sample count."},
-            "verifier": {"type": "string", "enum": ["self_consistency", "judge", "none"],
+            "verifier": {"type": "string",
+                         "enum": ["self_consistency", "judge", "independent_judge",
+                                  "independent_quorum", "none"],
                          "default": "self_consistency",
-                         "description": "self_consistency = N-of-M samples agree (pair with "
-                         "answer_key); judge = adversarial LLM check; none = no gate."},
+                         "description": ("How the answer is checked before you're charged: "
+                         "self_consistency = N-of-M samples agree (pair with answer_key); "
+                         "judge = adversarial LLM check; "
+                         "independent_judge = a DIFFERENT model family checks it (decorrelated from "
+                         "your model's blind spots — the one check you can't self-supply); "
+                         "independent_quorum = multiple independent models ACROSS VENDORS must agree "
+                         "(k-of-M; pass quorum_k); none = no gate. The independent verifiers charge "
+                         "only if they pass; pass a 'candidate' to verify your agent's OWN answer "
+                         "with no generation.")},
             "answer_key": {"type": "array", "items": {"type": "string"},
                            "description": 'How to extract the comparable answer for self_consistency '
                            '— ["json","<field>"] or ["regex","(<pat>)"]. Recommended; without it, '
                            'agreement is measured on the full text and rarely matches on prose.'},
+            "candidate": {"type": "string", "description": "Optional: your agent's OWN answer to "
+                          "verify directly — skips generation, the independent judge just checks it."},
+            "quorum_k": {"type": "integer", "description": "For independent_quorum: how many of the "
+                         "M independent models must agree (k-of-M)."},
             "model": {"type": "string", "description": "Optional model override (must match your BYOK key)."},
         },
         "required": ["request"],
@@ -121,6 +136,10 @@ def buy(args):
             "verifier": args.get("verifier", "self_consistency")}
     if args.get("answer_key"):
         body["answer_key"] = args["answer_key"]
+    if args.get("candidate"):
+        body["candidate"] = args["candidate"]
+    if args.get("quorum_k") is not None:
+        body["quorum_k"] = int(args["quorum_k"])
     if args.get("model"):
         body["model"] = args["model"]
     extra = {"X-Provider-Key": PROVIDER_KEY} if PROVIDER_KEY else None   # BYOK
@@ -141,22 +160,22 @@ def _gate_banner(resp):
     c = g.get("confidence")
     conf = f" (confidence {c})" if c is not None else ""
     if g.get("action") == "hold":
-        return (f"⛔ GATE: HOLD — the answer did NOT pass the verifier{conf}. "
+        return (f"GATE: HOLD — the answer did NOT pass the verifier{conf}. "
                 "DO NOT act on it; re-try, escalate to a human, or treat the decision as "
                 "unresolved. You were NOT charged.\n\n")
     if g.get("action") == "proceed":
         tx = resp.get("tx")
         rcpt = f" Receipt: {tx}." if tx else ""
-        return f"✅ GATE: PROCEED — answer passed the verifier{conf}. Safe to act on.{rcpt}\n\n"
+        return f"GATE: PROCEED — answer passed the verifier{conf}; OK to proceed (verified, not guaranteed).{rcpt}\n\n"
     return ""
 
 
 def _price_banner(resp):
     """Hoist the best-price result to the first line the agent reads."""
     if resp.get("error"):
-        return f"⚠️ {resp['error']}\n\n"
+        return f"ERROR: {resp['error']}\n\n"
     if resp.get("status") == "no_results":
-        return "ℹ️ No real results found — you were NOT charged.\n\n"
+        return "No real results found — you were NOT charged.\n\n"
     deals = (resp.get("result") or {}).get("deals") or []
     if resp.get("status") == "ok" and deals:
         top = deals[0]
@@ -165,7 +184,7 @@ def _price_banner(resp):
         seller = top.get("best_seller") or top.get("source") or "?"
         tx = resp.get("tx")
         rcpt = f" Receipt: {tx}." if tx else ""
-        return (f"💲 BEST PRICE: {name} — ${price} @ {seller} "
+        return (f"BEST PRICE: {name} — ${price} @ {seller} "
                 f"({resp.get('count', len(deals))} sellers compared).{rcpt}\n\n")
     return ""
 

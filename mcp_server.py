@@ -27,9 +27,10 @@ TOOL = {
     "name": "buy_verified_burst",
     "description": (
         "Buy a verified inference burst at a hard/irreversible/low-confidence decision. "
-        "Escalates to fast silicon, samples best-of-N, gates the answer through a verifier, "
-        "and charges (x402) ONLY if it passes. Returns the verified answer + a receipt. "
-        "Budget-capped per agent. Use when getting it wrong is costly."),
+        "Escalates to fast silicon, samples best-of-N, then gates the answer through a verifier — "
+        "up to an INDEPENDENT model family (a different vendor) that checks it, the one check your "
+        "own correlated samples can't supply — and charges (x402) ONLY if it passes. Returns the "
+        "verified answer + a receipt. Budget-capped per agent. Use when getting it wrong is costly."),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -37,10 +38,18 @@ TOOL = {
             "strategy": {"type": "string", "enum": ["fast", "best_of_n"], "default": "best_of_n"},
             "n": {"type": "integer", "default": 3, "description": "best-of-N sample count."},
             "verifier": {"type": "string",
-                         "enum": ["self_consistency", "judge", "none"],
-                         "default": "self_consistency"},
+                         "enum": ["self_consistency", "judge", "independent_judge",
+                                  "independent_quorum", "none"],
+                         "default": "self_consistency",
+                         "description": ("self_consistency = N-of-M samples agree; judge = "
+                         "adversarial LLM check; independent_judge = a DIFFERENT model family "
+                         "checks it (the one check you can't self-supply); independent_quorum = "
+                         "multiple independent models across vendors must agree (k-of-M; pass "
+                         "quorum_k); none = no gate.")},
             "answer_key": {"type": "array", "items": {"type": "string"},
                            "description": 'Optional ["json","<field>"] or ["regex","<pat>"] to normalize answers.'},
+            "candidate": {"type": "string", "description": "Optional: an answer to verify directly (skips generation)."},
+            "quorum_k": {"type": "integer", "description": "For independent_quorum: how many of M models must agree."},
         },
         "required": ["request"],
     },
@@ -81,6 +90,7 @@ def call_tool(args):
     strategy = args.get("strategy", "best_of_n")
     n = int(args.get("n", 3))
     verifier = args.get("verifier", "self_consistency")
+    qk = args.get("quorum_k")
     result = broker.serve_burst(
         args["request"],
         x_payment=_payment(strategy, n, verifier),
@@ -88,6 +98,8 @@ def call_tool(args):
         n=n,
         verifier=verifier,
         answer_key=tuple(ak) if isinstance(ak, list) else None,
+        candidate=args.get("candidate"),
+        quorum_k=int(qk) if qk is not None else None,
         receipt_id=f"mcp-{AGENT_ID}",
         # BYOK: agent's own provider key (their tokens/rate limit), never logged.
         provider_key=os.environ.get("BURST_PROVIDER_KEY"),
