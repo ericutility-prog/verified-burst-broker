@@ -69,7 +69,15 @@ _conn.commit()
 # The API below is storage-agnostic — reimplement these functions against
 # Postgres/Redis (row locks / atomic INCR) for multi-process or multi-host scale;
 # nothing in broker.py changes.
-_EPS = 1e-9  # float dust threshold so released holds settle cleanly back to ~0
+#
+# CONCURRENCY CONTRACT — read before adding a breaker.
+# _LOCK is a process-local threading.Lock, so every check-and-write below is atomic
+# only WITHIN this process. That is sufficient today (server.py runs one
+# ThreadingHTTPServer) and becomes wrong the moment a second worker process exists.
+# A breaker whose CHECK and WRITE are separate calls is not protected by any of this:
+# it must be expressed as ONE function here (see trial_claim / judge_enter), because
+# the gap between two calls is where 8 concurrent requests all read zero.
+_INFLIGHT_JUDGE = {}   # payer -> judged bursts currently running in THIS process
 
 
 # --- reads ------------------------------------------------------------------ #
@@ -157,17 +165,122 @@ def record_miss(payer: str) -> int:
     return int(row[0])
 
 
-def clear_misses(payer: str) -> None:
-    """A pass clears the streak."""
-    with _LOCK, _conn:
-        _conn.execute("UPDATE ledger SET misses = 0 WHERE payer=?", (payer,))
-
-
 def trial_inc(payer: str) -> None:
     with _LOCK, _conn:
         _conn.execute(
             "INSERT INTO ledger(payer, trial) VALUES(?, 1) "
             "ON CONFLICT(payer) DO UPDATE SET trial = trial + 1", (payer,))
+
+
+def trial_claim(payer: str, cap: int) -> bool:
+    """Atomically CLAIM one free-trial slot. Returns True if a slot was taken.
+
+    Replaces read-trial_count-now / trial_inc-later: those are two calls with a whole
+    burst between them, so N concurrent requests all read the same count and all pass a
+    cap of 1. The claim happens up front and is refunded by trial_unclaim if the burst
+    never runs. Conditional UPDATE + rowcount is the check and the write in one statement.
+    """
+    if cap <= 0:
+        return False
+    with _LOCK, _conn:
+        _conn.execute("INSERT OR IGNORE INTO ledger(payer) VALUES(?)", (payer,))
+        cur = _conn.execute(
+            "UPDATE ledger SET trial = trial + 1 WHERE payer=? AND trial < ?", (payer, cap))
+        return cur.rowcount > 0
+
+
+def trial_unclaim(payer: str) -> None:
+    """Give back a claimed trial slot when the burst never happened."""
+    with _LOCK, _conn:
+        _conn.execute("UPDATE ledger SET trial = MAX(0, trial - 1) WHERE payer=?", (payer,))
+
+
+def judge_enter(payer: str, limit: int) -> bool:
+    """Atomically admit ONE broker-paid judged burst, counting settled misses AND the
+    bursts this process already has in flight. Without the in-flight term the breaker is
+    a read-then-act: miss_count is read before the burst and record_miss written after,
+    so N concurrent requests all see the pre-burst count and all pass.
+
+    In-flight state is deliberately in-memory: it describes work running in THIS process
+    and must vanish if the process dies, which is exactly what a restart should do.
+    """
+    with _LOCK:
+        row = _conn.execute("SELECT misses FROM ledger WHERE payer=?", (payer,)).fetchone()
+        settled = int(row[0]) if row else 0
+        if settled + _INFLIGHT_JUDGE.get(payer, 0) >= limit:
+            return False
+        _INFLIGHT_JUDGE[payer] = _INFLIGHT_JUDGE.get(payer, 0) + 1
+        return True
+
+
+def judge_exit(payer: str) -> None:
+    with _LOCK:
+        n = _INFLIGHT_JUDGE.get(payer, 0) - 1
+        if n > 0:
+            _INFLIGHT_JUDGE[payer] = n
+        else:
+            _INFLIGHT_JUDGE.pop(payer, None)      # bounded memory: drop empty entries
+
+
+# --- ambiguous settlements (money MAY have moved) --------------------------- #
+def pending_add(nonce: str, payer: str, amount: float, tx: str, reason: str) -> None:
+    """Record a settlement we could not prove either way.
+
+    The dangerous state is not "settle failed" — it is "settle reported success and the
+    chain did not confirm it." Releasing the hold and telling the buyer they were not
+    charged is a CLAIM, and on this branch we cannot support it. Writing the row first
+    means the ambiguity survives a restart and can be reconciled against the chain.
+    """
+    with _LOCK, _conn:
+        _conn.execute(
+            "INSERT INTO pending_settle(nonce, payer, amount, tx, reason, ts) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(nonce) DO UPDATE SET "
+            "tx = excluded.tx, reason = excluded.reason, ts = excluded.ts",
+            (nonce or f"{payer}:{time.time()}", payer, float(amount), tx or "", reason,
+             time.time()))
+
+
+def pending_list():
+    with _LOCK:
+        rows = _conn.execute(
+            "SELECT nonce, payer, amount, tx, reason, ts FROM pending_settle "
+            "ORDER BY ts").fetchall()
+    return [{"nonce": r[0], "payer": r[1], "amount": r[2], "tx": r[3],
+             "reason": r[4], "ts": r[5]} for r in rows]
+
+
+def pending_clear(nonce: str) -> None:
+    with _LOCK, _conn:
+        _conn.execute("DELETE FROM pending_settle WHERE nonce=?", (nonce,))
+
+
+# --- boot recovery ---------------------------------------------------------- #
+def recover_holds():
+    """Release every outstanding hold. Call ONCE at boot, never while serving.
+
+    A hold only exists between reserve() and release()/commit(), which both live inside a
+    single request. So at process start no hold can legitimately be outstanding: anything
+    non-zero was stranded by a crash, and nothing else in the system will ever free it —
+    it silently shrinks that payer's cap forever. Returns the rows it cleared so the
+    caller can log them; a silent recovery would hide the crash that caused it.
+
+    NOT safe if a second worker process is ever added (it would free live holds). See the
+    concurrency contract at the top of this module.
+    """
+    with _LOCK, _conn:
+        rows = _conn.execute(
+            "SELECT payer, reserved FROM ledger WHERE reserved > 0").fetchall()
+        _conn.execute("UPDATE ledger SET reserved = 0 WHERE reserved > 0")
+    return [{"payer": r[0], "amount": r[1]} for r in rows]
+
+
+def prune_nonces(max_age_s: float = 30 * 86400) -> int:
+    """Drop dedup keys older than max_age_s. seen_nonce grows without bound otherwise —
+    an x402 authorization is long dead well before this, so pruning cannot enable a
+    replay that the chain would still honour."""
+    with _LOCK, _conn:
+        cur = _conn.execute("DELETE FROM seen_nonce WHERE ts < ?", (time.time() - max_age_s,))
+        return cur.rowcount
 
 
 def global_judge_reserve(judges: int, daily_cap: int) -> bool:

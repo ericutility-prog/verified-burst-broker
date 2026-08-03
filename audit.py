@@ -37,6 +37,12 @@ CHECKS = [
     ("unit:guard", "test_guard.py", False),
     ("unit:flagstore", "test_flagstore.py", False),
     ("unit:clearance", "test_clearance.py", False),
+    ("unit:concurrency", "test_concurrency.py", False),
+    ("unit:judge_fence", "test_judge_fence.py", False),
+    ("unit:tiered", "test_tiered.py", False),
+    ("unit:tiered_serve", "test_tiered_serve.py", False),
+    ("unit:tiered_thinrung", "test_tiered_thinrung.py", False),
+    ("unit:bestprice_settle", "test_bestprice_settle.py", False),
     ("security_probe", "security_probe.py", False),
 ]
 

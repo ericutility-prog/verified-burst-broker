@@ -25,6 +25,12 @@ REASONING = os.environ.get("VERIFIER_REASONING_JUDGE",
                            "openrouter:qwen/qwen3-235b-a22b-thinking-2507").strip()
 REASONING_MAX = int(os.environ.get("VERIFIER_REASONING_MAX_TOKENS", "4000"))
 ESCALATE = os.environ.get("VERIFIER_ESCALATE", "nonunanimous_pass").strip()
+# Minimum judges for the fast rung to be able to say "unanimous" and TERMINATE on a pass.
+# One judge agreeing with itself is not a quorum: with a single fast judge, ESCALATE=
+# nonunanimous_pass makes `unanimous_pass` true on that one vote, the reasoning rung is
+# never consulted on the pass side, and a payable verdict becomes a 1-of-1 call. Set to 1
+# only if you deliberately want a single-judge fast tier to be terminal.
+MIN_FAST_JUDGES = int(os.environ.get("VERIFIER_MIN_FAST_JUDGES", "2"))
 
 
 def _parse_spec(spec):
@@ -118,8 +124,23 @@ def verify(answer, request, *, fast_fns=None, reasoning=None, human_gate=None,
     else:  # nonunanimous_pass (default)
         esc = not unanimous_pass
 
+    # A fast rung thinner than MIN_FAST_JUDGES cannot produce a meaningful "unanimous" pass.
+    # Losing a judge (a deprecated model, an unset env var, a filtered-out generator match)
+    # must degrade to MORE scrutiny, not less — otherwise the pool silently shrinking turns a
+    # terminal PASS into a single model's opinion while the receipt still says independent.
+    # ESCALATE="never" is an explicit operator override and is left alone.
+    thin_rung = len(votes) < MIN_FAST_JUDGES
+    if thin_rung and escalate != "never":
+        esc = True
+
+    # independent = at least one judge DECORRELATED FROM THE GENERATOR — the same predicate
+    # burst.py:192 already uses for independent_judge. `bool(votes)` was weaker: it said True
+    # for any vote at all, and that flag is load-bearing (broker._receipt, flagstore.is_cleared,
+    # and clearance.py's cert["cleared"] = verified and independent, which strangers honour).
     base = {"method": "tiered", "generator_model": generator_model,
-            "fast_votes": votes, "independent": bool(votes)}
+            "fast_votes": votes, "fast_judge_count": len(votes), "thin_fast_rung": thin_rung,
+            "independent": any((v.get("verifier_model") or "") != (generator_model or "")
+                               for v in votes)}
 
     if not esc:
         # Terminal on the fast path. adequate = the fast consensus (True only if unanimous
@@ -138,7 +159,12 @@ def verify(answer, request, *, fast_fns=None, reasoning=None, human_gate=None,
         rv = _run_judge(answer, request, rfn, rmodel)
         out = {**base, "tier": "escalated", "adequate": rv["adequate"] is True,
                "verifier_model": rmodel, "reasoning_vote": rv,
-               "escalation_reason": _reason(votes)}
+               # the reasoning judge is itself decorrelated from the generator, so it
+               # supplies independence even when the fast rung was thin or empty.
+               "independent": base["independent"] or ((rmodel or "") != (generator_model or "")),
+               "escalation_reason": (("fast rung had %d judge(s), need %d for a terminal pass; "
+                                      % (len(votes), MIN_FAST_JUDGES)) if thin_rung else "")
+                                    + (_reason(votes) or "")}
 
     # RUNG 2 — human gate (extension point; default OFF). Contract:
     #   human_gate(answer, request, verdict) ->

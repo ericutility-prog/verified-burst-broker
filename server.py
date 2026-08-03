@@ -559,10 +559,19 @@ class Handler(BaseHTTPRequestHandler):
                              "accepts": obj["accepts"]}
                 pr = base64.b64encode(json.dumps(challenge).encode()).decode()
                 self.send_header("PAYMENT-REQUIRED", pr)
-            except Exception:
-                pass
+            except Exception as e:
+                # Degrading to "no PAYMENT-REQUIRED header" is deliberate: the body
+                # still carries `accepts`, so body-reading clients are unaffected.
+                # But header-parsing indexers would silently stop seeing payment
+                # challenges, so the degradation itself must never be silent.
+                print("x402: PAYMENT-REQUIRED header omitted: %s: %s"
+                      % (type(e).__name__, e), flush=True)
         for k, v in (extra_headers or {}).items():
-            self.send_header(k, v)
+            # X-PAYMENT-RESPONSE carries a facilitator-supplied tx hash. BaseHTTPRequestHandler
+            # does NOT validate header values, so a CR/LF in one would split the response.
+            # We already refuse to take this party's word on settlement (defense #6); taking
+            # its word on header bytes would be the same trust by another door.
+            self.send_header(k, str(v).replace("\r", "").replace("\n", "")[:256])
         self.end_headers()
         # HEAD: headers (incl. Content-Length) are sent, body is suppressed — so a
         # crawler that probes with HEAD gets a real 200/402, not a 501 dead-end.
@@ -845,7 +854,13 @@ class Handler(BaseHTTPRequestHandler):
         if len(query) > MAX_REQ_CHARS:
             return self._send(413, {"error": "query_too_long", "max_chars": MAX_REQ_CHARS})
 
-        result = bestprice.serve_search(query, x_payment=self.headers.get("X-PAYMENT"))
+        try:
+            result = bestprice.serve_search(query, x_payment=self.headers.get("X-PAYMENT"))
+        except Exception as e:
+            # Mirrors the /v1/burst path: fail closed, no stack leak. A raise after
+            # ledger.reserve() would otherwise strand the hold until the next boot's
+            # recover_holds(); the settle window itself is now write-ahead recorded.
+            return self._send(500, {"error": "internal_error", "detail": type(e).__name__})
 
         if result["status"] == "payment_required":
             return self._send(402, {"x402Version": 2, "accepts": result["accepts"],
@@ -881,8 +896,30 @@ def main():
             if _pin.lower() != _have.lower():
                 print(f"WARNING: CLEARANCE_ISSUER {_pin} != signer address {_have} — "
                       "genuine clearance certs will be REJECTED by the default verifier", flush=True)
-    except Exception:
-        pass
+    except Exception as e:
+        # This block exists to WARN. Swallowing its failure makes a check that
+        # COULD NOT RUN look exactly like a check that PASSED - which is the very
+        # condition the warning above is here to catch.
+        print("WARNING: clearance issuer/signer check could NOT RUN (%s: %s) - "
+              "an issuer/signer mismatch would go UNDETECTED"
+              % (type(e).__name__, e), flush=True)
+    # Boot recovery: a hold only exists between reserve() and release()/commit(), both
+    # inside one request. So at start-up nothing can legitimately be held — anything
+    # outstanding was stranded by a crash and nothing else will ever free it, silently
+    # shrinking that payer's cap forever. Recover LOUDLY: a silent recovery would hide
+    # the crash that caused it. (Single-process only — see ledger's concurrency contract.)
+    import ledger as _ledger
+    for _h in _ledger.recover_holds():
+        print(f"RECOVERED stranded hold: payer={_h['payer']} amount={_h['amount']:.6f} "
+              "(a previous process died mid-burst)", flush=True)
+    _pruned = _ledger.prune_nonces()          # seen_nonce grows forever otherwise
+    if _pruned:
+        print(f"pruned {_pruned} expired payment-dedup keys", flush=True)
+    for _p in _ledger.pending_list():
+        print(f"UNRESOLVED settlement: payer={_p['payer']} amount={_p['amount']:.6f} "
+              f"tx={_p['tx'] or '<none>'} reason={_p['reason']} — reconcile against the chain",
+              flush=True)
+
     print(f"verified-burst broker on {BIND_HOST}:{port}  "
           f"(x402={mode}, rate={RATE_PER_MIN}/min/ip, model={pricing.quote()['model']})")
     httpd = ThreadingHTTPServer((BIND_HOST, port), Handler)

@@ -15,6 +15,7 @@ Run:
 """
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -90,22 +91,44 @@ def tts_voices():
     return "", [], None
 
 
+class UnknownVoice(ValueError):
+    """Raised when a caller supplies a voice id the server never published."""
+
+
+def _resolve_voice(voice):
+    """Return a voice id that is provably one of ours, or raise.
+
+    The old code interpolated the caller's string into the ElevenLabs URL path after
+    urllib.parse.quote(), which defaults to safe='/' and therefore leaves '/' and '.'
+    intact -- quote('../../v1/history') is unchanged. Escaping was never the right
+    control here: the set of valid ids is small, fixed, and published by this server.
+    """
+    _, vs, default = tts_voices()
+    allowed = {i for _, i in vs}
+    vid = voice or default
+    if vid not in allowed:
+        raise UnknownVoice("unknown voice id")
+    return vid
+
+
 def tts_synthesize(text, voice, timeout=30):
     """Synthesize `text` to mp3 bytes via the active provider. Raises on error."""
     prov, key = tts_config()
     if not prov:
         raise RuntimeError("no tts provider")
     if prov == "elevenlabs":
-        vid = voice or EL_VOICES[0][1]
+        vid = _resolve_voice(voice)
+        # safe='' so a slash could never survive even if the allowlist above were
+        # widened later. The allowlist is the control; this is the belt.
         url = ("https://api.elevenlabs.io/v1/text-to-speech/"
-               + urllib.parse.quote(vid) + "?output_format=mp3_44100_128")
+               + urllib.parse.quote(vid, safe='') + "?output_format=mp3_44100_128")
         body = json.dumps({"text": text,
                            "model_id": os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5")}).encode()
         req = urllib.request.Request(url, data=body, headers={
             "xi-api-key": key, "Content-Type": "application/json", "Accept": "audio/mpeg"})
     else:  # openai
         body = json.dumps({"model": os.environ.get("OPENAI_TTS_MODEL", "tts-1"),
-                           "voice": voice or "nova", "input": text,
+                           "voice": _resolve_voice(voice), "input": text,
                            "response_format": "mp3"}).encode()
         req = urllib.request.Request("https://api.openai.com/v1/audio/speech", data=body,
                                      headers={"Authorization": "Bearer " + key,
@@ -122,6 +145,11 @@ DEMO_KEY = os.environ.get("VOICE_DEMO_KEY", "")
 _hits = {}
 _tts_hits = {}             # TTS is called per sentence — its own, roomier window
 _day = {"day": None, "n": 0}
+# The PAID path's own budget. Characters, because that is what ElevenLabs bills and
+# what the plan is denominated in; counting requests would let a 500-char call and a
+# 20-char call cost the same against the cap.
+TTS_DAILY_CHARS = int(os.environ.get("VOICE_DEMO_TTS_DAILY_CHARS", "5000"))
+_tts_day = {"day": None, "chars": 0}
 
 
 def _rate_ok(ip):
@@ -151,6 +179,29 @@ def _daily_ok():
     if _day["n"] >= DAILY_MAX:
         return False
     _day["n"] += 1
+    return True
+
+
+def _tts_daily_ok(nchars):
+    """Global daily CHARACTER budget for the paid TTS path.
+
+    Added 2026-08-02: this path had no global budget at all. `_premium_ok()` is a
+    shared token, not a limit, and `_tts_rate_ok()` is PER-IP — and per-IP bounds
+    nobody, because whoever holds the token can use more IPs. So the only genuinely
+    expensive call in this service was the only one with no ceiling.
+
+    Returns False WITHOUT consuming budget, so a rejected request cannot itself eat
+    the quota it was refused for.
+    """
+    day = int(time.time() // 86400)
+    if _tts_day["day"] != day:
+        _tts_day["day"], _tts_day["chars"] = day, 0
+    if _tts_day["chars"] + nchars > TTS_DAILY_CHARS:
+        # LOUD. A cap that sheds traffic silently is the same defect as no cap.
+        print("TTS DAILY BUDGET BINDING: %d/%d chars used today, refused %d more"
+              % (_tts_day["chars"], TTS_DAILY_CHARS, nchars), flush=True)
+        return False
+    _tts_day["chars"] += nchars
     return True
 
 
@@ -264,8 +315,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(422, {"error": "empty text"})
         if not tts_config()[0]:
             return self._json(503, {"error": "no TTS provider configured"})
+        if not _tts_daily_ok(len(text)):
+            return self._json(429, {
+                "error": "daily TTS character budget exhausted",
+                "detail": "the paid voice quota is capped per day; it resets at 00:00 UTC"})
         try:
             audio = tts_synthesize(text, voice)
+        except UnknownVoice:
+            return self._json(400, {"error": "unknown voice id"})
         except urllib.error.HTTPError as e:
             return self._json(502, {"error": f"tts upstream HTTP {e.code}"})
         except Exception as e:
@@ -322,10 +379,20 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: " + json.dumps(
                 {"error": f"upstream HTTP {e.code}"}).encode() + b"\n\n")
         except Exception as e:
+            # Record FIRST. `log_message` is disabled on this handler, so stderr
+            # -> journald is the only trace a failed stream ever leaves; without
+            # this the demo failing is indistinguishable from nobody using it.
+            sys.stderr.write("voice-demo: stream failed: %s: %s\n"
+                             % (type(e).__name__, e))
+            sys.stderr.flush()
             try:
                 self.wfile.write(b"data: " + json.dumps(
                     {"error": f"{type(e).__name__}"}).encode() + b"\n\n")
-            except Exception:
+            except OSError:
+                # BrokenPipe/ConnectionReset: the client is already gone, so there
+                # is no one left to tell and the failure is recorded above. This is
+                # the one case where passing is correct. Anything OTHER than a dead
+                # socket now propagates and is visible rather than swallowed.
                 pass
 
     def log_message(self, *a):

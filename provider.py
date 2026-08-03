@@ -35,7 +35,9 @@ CEREBRAS = {
 OPENROUTER = {
     "base_url": "https://openrouter.ai/api/v1",
     "key_env": "OPENROUTER_API_KEY",
-    "model": os.environ.get("OPENROUTER_JUDGE_MODEL", ""),
+    # first entry only: OPENROUTER_JUDGE_MODEL may be a comma-separated LIST, and a
+    # concatenated string here would be a bogus default model id.
+    "model": os.environ.get("OPENROUTER_JUDGE_MODEL", "").split(",")[0].strip(),
     "price_in": 0.0, "price_out": 0.0, "price_verified": False,  # judge cost is ours, varies by model
     "headers": {"HTTP-Referer": "https://solcleus.com", "X-Title": "Verified Burst"},
 }

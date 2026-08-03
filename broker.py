@@ -19,12 +19,27 @@ from x402_gate import Facilitator, build_requirements
 def _payment_key(x_payment):
     """A stable, unforgeable dedup key for a signed x402 authorization — its nonce +
     signature. Used to make a payment single-use (no replay, no concurrent fan-out).
-    Returns None when the payment can't be decoded (the SIM/test facilitator shapes),
-    which is safe: sim is loopback-only by the boot guard, so there's nothing to dedup."""
+
+    DECODES EXACTLY WHAT THE FACILITATOR ACCEPTS. x402_live._coerce_payload takes
+    base64-of-JSON *or* raw JSON; keying only the base64 shape meant a caller could send
+    a perfectly valid authorization as raw JSON, get it verified, and produce no key —
+    and a None key skips claim_nonce entirely, silently disabling single-use. Any shape
+    the facilitator will authorize must therefore be a shape we can key.
+
+    Returns None only when there is genuinely nothing to key (an opaque in-process test
+    string like "sim"). That path is safe because a facilitator that authorizes such a
+    payment is the SIM one, which refuses to run unless ALLOW_PUBLIC_SIM=1 and is
+    loopback-only by the boot guard — never a real payment on a public process.
+    """
     if not x_payment or not isinstance(x_payment, str):
         return None
-    try:
-        obj = json.loads(base64.b64decode(x_payment, validate=True))
+    for decode in (lambda v: base64.b64decode(v, validate=True), lambda v: v):
+        try:
+            obj = json.loads(decode(x_payment))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
         payload = obj.get("payload") or {}
         auth = payload.get("authorization") or {}
         sig = payload.get("signature") or ""
@@ -32,13 +47,31 @@ def _payment_key(x_payment):
         if not (sig or nonce):
             return None
         return hashlib.sha256(f"{nonce}|{sig}".encode()).hexdigest()
-    except Exception:
-        return None
+    return None
 
 
-def _settle_failed(payer, budget_cap):
-    """Verifier passed but the payment did not capture on-chain. The result is withheld
-    and nothing is charged; the buyer signs a fresh payment to retry."""
+def _settle_failed(payer, budget_cap, *, ambiguous=False, tx=None):
+    """Verifier passed but the capture did not complete. The result is withheld.
+
+    Two very different cases, and telling them apart is the whole point:
+
+    ambiguous=False — the facilitator reported FAILURE. No funds moved, so "you were not
+        charged" is a fact and we state it.
+    ambiguous=True  — the facilitator reported SUCCESS (or died mid-call) and the chain
+        did not confirm it. We do NOT know whether funds moved, so claiming the buyer
+        was not charged would be asserting something we cannot support — and if it were
+        wrong, we would have taken money and denied it. The row is recorded in
+        pending_settle for reconciliation and the buyer is told the truth: unresolved.
+    """
+    if ambiguous:
+        return {"status": "settle_unresolved", "charged": None, "price_usd": 0.0,
+                "payer": payer, "settle_tx": tx or None,
+                "hint": ("payment capture reported success but could NOT be confirmed "
+                         "on-chain. We do not yet know whether you were charged, so we are "
+                         "not claiming either way — the result is withheld and this "
+                         "settlement is recorded for reconciliation. Do not re-send the "
+                         "same authorization; contact us with this tx if one is shown."),
+                "remaining_budget_usd": round(remaining_budget(payer, budget_cap), 6)}
     return {"status": "settle_failed", "charged": False, "price_usd": 0.0, "payer": payer,
             "hint": ("payment capture did not confirm on-chain — the result is withheld "
                      "and you were NOT charged; retry with a fresh payment"),
@@ -85,15 +118,23 @@ JUDGE_FAMILIES = [m.strip() for m in
 # both the key and a model are set; otherwise the pool is the Cerebras families and
 # behaviour is unchanged. This is what makes "independent" defensible with no asterisk
 # and deepens the quorum past 2-of-2.
-OPENROUTER_JUDGE_MODEL = os.environ.get("OPENROUTER_JUDGE_MODEL", "").strip()
+# Comma-separated so the cross-provider slot can hold MORE THAN ONE judge. A single value
+# still works unchanged. Depth here is what makes the quorum more than 2-of-2 — and note the
+# generator (gpt-oss-120b) is OpenAI-lineage, so a judge from a DIFFERENT LAB decorrelates
+# more than merely a different vendor does.
+# Caveat, stated because it is easy to overclaim: several OpenRouter judges have decorrelated
+# WEIGHTS but share one GATEWAY, so they are not independent of OpenRouter itself being down.
+OPENROUTER_JUDGE_MODELS = [m.strip() for m in
+                           os.environ.get("OPENROUTER_JUDGE_MODEL", "").split(",") if m.strip()]
+OPENROUTER_JUDGE_MODEL = OPENROUTER_JUDGE_MODELS[0] if OPENROUTER_JUDGE_MODELS else ""
 
 
 def _judge_pool():
     """All configured judges as (provider, model). Cerebras families always; the
     OpenRouter cross-provider judge appended when its key + model are present."""
     pool = [("cerebras", m) for m in JUDGE_FAMILIES]
-    if OPENROUTER_JUDGE_MODEL and os.environ.get("OPENROUTER_API_KEY"):
-        pool.append(("openrouter", OPENROUTER_JUDGE_MODEL))
+    if OPENROUTER_JUDGE_MODELS and os.environ.get("OPENROUTER_API_KEY"):
+        pool.extend(("openrouter", m) for m in OPENROUTER_JUDGE_MODELS)
     return pool
 
 
@@ -249,13 +290,22 @@ def _confirm_settlement_onchain(tx, pay_to, price_usd):
     proves revert / underpay / wrong-payee -> WITHHOLD), or 'unknown' (sim tx or receipt
     unreachable -> trust the facilitator rather than block legit revenue on RPC flakiness)."""
     import clearance
-    if not isinstance(tx, str) or not clearance._HASH_RE.match(tx):
+    # Three outcomes, not two — 'no evidence' is NOT the same as 'evidence unavailable'.
+    #   none    = we were given nothing to check, or cannot check by configuration. The
+    #             facilitator's success claim stands entirely unsupported -> withhold.
+    #   unknown = there IS a reason we can't check this particular tx (a sim-shaped hash,
+    #             a flaky RPC) -> trust the facilitator rather than block real revenue.
+    # Collapsing 'none' into 'unknown' is what let a facilitator report success with an
+    # EMPTY tx and buy a free result — precisely the case this function exists to stop.
+    if not isinstance(tx, str) or not tx.strip():
+        return "none"                         # success claimed, nothing surfaced to verify
+    if not clearance._HASH_RE.match(tx):
         return "unknown"                      # sim/demo tx -> nothing on-chain to check
     if not pay_to:
-        return "unknown"
+        return "none"                         # can't verify a payee we don't know
     usdc = clearance._USDC.get(clearance._network())
     if not usdc:
-        return "unknown"
+        return "none"                         # X402_NETWORK not one we can check on
     rcpt = clearance._default_receipt_fetch(tx)
     if rcpt is None:
         return "unknown"                      # RPC unreachable -> don't block revenue
@@ -329,16 +379,21 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     is_trial = False
     if not provider_key and require_byok:
         used = ledger.trial_count(payer)
-        if trial_cap and used < trial_cap:
+        # CLAIM the slot up front, atomically. Reading the count here and incrementing
+        # after the burst is two calls with the whole burst between them, so N concurrent
+        # requests all read the same count and all pass a cap of 1. trial_claim is the
+        # check and the write in one statement; trial_unclaim refunds it if we bail.
+        if trial_cap and ledger.trial_claim(payer, trial_cap):
             # Global Sybil cap (mirrors the independent-judge Rule 3): cap aggregate
             # host-key trial burn/day from UNPROVEN wallets so wallet rotation can't
             # defeat the per-wallet trial_cap. Proven payers (settled >=1) bypass.
             if not ledger.is_proven(payer) and not ledger.global_trial_reserve(1, TRIAL_GLOBAL_DAILY):
+                ledger.trial_unclaim(payer)         # slot not actually used
                 return {"status": "trial_exhausted", "payer": payer,
                         "trial_used": used, "trial_cap": trial_cap,
                         "hint": ("daily free-trial host-inference budget is spent — send "
                                  "X-Provider-Key with your own Cerebras key, or retry tomorrow")}
-            is_trial = True   # runs on the host env key; the slot is consumed after the burst
+            is_trial = True   # slot already consumed by the claim above
         else:
             return {"status": "byok_required", "payer": payer,
                     "trial_used": used, "trial_cap": trial_cap,
@@ -348,6 +403,8 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
 
     # 2b) anti-abuse for the broker-paid judges (independent_judge + independent_quorum
     #     are the only paths that spend OUR tokens).
+    judge_slot = False          # set once we hold an in-flight judge admission
+    miss_recorded = False       # record_miss happens inside the admission window, not after
     if verifier in ("independent_judge", "independent_quorum", "tiered"):
         # Rule 1: never run the broker-paid judge on the host key. BYOK-only means a
         # miss costs us at most the judge call(s), never the buyer's generation. WAIVED
@@ -368,15 +425,22 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
         # outrun their legitimate misses keeps headroom; a tiny-payment attacker stays near
         # base. (Unproven wallets never pass without settling, so lifetime == streak there.)
         proven = ledger.is_proven(payer)
-        if ledger.miss_count(payer) >= _miss_limit(payer):
+        # ADMIT atomically, counting settled misses AND the judged bursts this process
+        # already has running. Reading miss_count here and writing record_miss after the
+        # burst is a read-then-act: every concurrent request sees the same pre-burst count
+        # and they all pass a limit of 3. The slot is returned in the finally below.
+        if not ledger.judge_enter(payer, _miss_limit(payer)):
             return {"status": "verifier_locked", "payer": payer,
                     "verifier": verifier, "misses": ledger.miss_count(payer),
                     "hint": ("too many consecutive unverified independent bursts. "
                              "Use verifier=self_consistency (free to us, BYOK), or settle "
                              "one passing burst to reset and unlock broker-paid independence.")}
+        judge_slot = True
         # Rule 3 (global): cap aggregate host-key judge burn from unproven wallets/day,
         # so wallet rotation can't defeat the per-wallet breaker. Proven payers bypass.
         if not proven and not ledger.global_judge_reserve(judges, IJ_GLOBAL_DAILY):
+            ledger.judge_exit(payer)            # admitted above but not proceeding
+            judge_slot = False
             return {"status": "verifier_locked", "payer": payer, "verifier": verifier,
                     "hint": ("daily independent-verification budget for unproven wallets is "
                              "spent. Settle a passing burst to unlock, or retry tomorrow.")}
@@ -386,6 +450,10 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     #    bursts from one wallet both clear the check before either settles. The hold is
     #    released on a miss/failure and converted to spend only on a settled pass.
     if not ledger.reserve(payer, q["price_usd"], budget_cap):
+        if judge_slot:                          # never ran; don't strand the admission
+            ledger.judge_exit(payer)
+        if is_trial:
+            ledger.trial_unclaim(payer)
         return {"status": "budget_exceeded", "payer": payer,
                 "remaining_usd": round(remaining_budget(payer, budget_cap), 6),
                 "price_usd": q["price_usd"]}
@@ -412,19 +480,31 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
                                   verify_fn=verify_fn, verifier_model=verifier_model,
                                   candidate=candidate, verify_fns=verify_fns, quorum_k=quorum_k,
                                   reasoning_fn=reasoning_fn, reasoning_model=reasoning_model)
+        # Record the miss HERE, inside the admission window. If we waited until after the
+        # finally below, the in-flight count would drop before the settled count rose, and
+        # one extra request would slip through the breaker in exactly that gap.
+        if not res.passed and verifier in ("independent_judge", "independent_quorum", "tiered"):
+            ledger.record_miss(payer)
+            miss_recorded = True
     except Exception:
         ledger.release(payer, q["price_usd"])   # burst blew up -> nothing charged, free the hold
+        if is_trial:
+            ledger.trial_unclaim(payer)         # the claimed slot was never spent
         raise
-    if is_trial:                       # consume one free-trial slot per completed host-key burst
-        ledger.trial_inc(payer)
+    finally:
+        if judge_slot:                          # return the admission however we leave
+            ledger.judge_exit(payer)
+            judge_slot = False
+    # NOTE: the free-trial slot was already consumed by ledger.trial_claim() above — the
+    # claim IS the increment, which is what makes the cap hold under concurrency.
 
     trial_remaining = max(0, trial_cap - ledger.trial_count(payer)) if trial_cap else 0
 
     # 5) settle ONLY if the verifier passed — else discard the authorization (no charge)
     if not res.passed:
         ledger.release(payer, q["price_usd"])   # miss -> free the hold, no charge
-        if verifier in ("independent_judge", "independent_quorum", "tiered"):  # count toward abuse breaker
-            ledger.record_miss(payer)
+        if not miss_recorded and verifier in ("independent_judge", "independent_quorum", "tiered"):
+            ledger.record_miss(payer)           # fallback; normally recorded above
         return {"status": "not_verified", "charged": False, "price_usd": 0.0,
                 "gate": _gate_signal(res),               # action=hold — don't act on this answer
                 "verdict": res.verdict, "answer": res.answer, "payer": payer,
@@ -438,22 +518,44 @@ def serve_burst(request, *, x_payment=None, strategy="best_of_n", n=3,
     # actually confirms. If settle errors or returns failure, WITHHOLD the answer and
     # release the hold: delivering a passing result without a captured payment would
     # break pay-only-if-verified (and let a reverted/expired auth buy free results).
+    # WRITE-AHEAD. Everything below can be interrupted by a process death, and a dead
+    # process writes nothing — so the record of "we are about to move money" must exist
+    # BEFORE we move it. Recording only on failure is unreachable in exactly the case
+    # that matters most. The row is cleared on a confirmed capture or a clean reported
+    # failure; whatever survives to the next boot is a settlement needing reconciliation.
+    settle_key = pay_key or f"{payer}|{receipt_id}|{q['price_usd']}"
+    ledger.pending_add(settle_key, payer, q["price_usd"], "", "settle in flight")
     try:
         s = fac.settle(x_payment, reqs)
-    except Exception:
-        ledger.release(payer, q["price_usd"])   # settle errored -> no money moved, free the hold
-        return _settle_failed(payer, budget_cap)
+    except Exception as e:
+        # The CALL died — we cannot know whether a broadcast went out and only the
+        # response was lost. Ambiguous, not a clean failure: the row stays.
+        ledger.pending_add(settle_key, payer, q["price_usd"], "",
+                           f"settle raised {type(e).__name__}")
+        ledger.release(payer, q["price_usd"])
+        return _settle_failed(payer, budget_cap, ambiguous=True)
     if not s["success"]:
-        ledger.release(payer, q["price_usd"])   # settle didn't confirm -> free the hold
+        # An explicit failure report IS evidence: nothing was captured. Safe to clear.
+        ledger.pending_clear(settle_key)
+        ledger.release(payer, q["price_usd"])
         return _settle_failed(payer, budget_cap)
     # #6 defense-in-depth: independently confirm the tx really moved the fee on-chain before
     # we commit/deliver. A facilitator that reports success without a real USDC transfer to
     # the seller (bug/compromise) is caught here -> withhold the answer, no charge. A sim tx
     # or an unreachable RPC -> 'unknown' -> trust the facilitator (don't block legit revenue).
-    if _confirm_settlement_onchain(s.get("tx"), os.environ.get("X402_PAY_TO"), q["price_usd"]) == "bad":
-        ledger.release(payer, q["price_usd"])   # chain contradicts the facilitator -> free the hold
-        return _settle_failed(payer, budget_cap)
+    conf = _confirm_settlement_onchain(s.get("tx"), os.environ.get("X402_PAY_TO"), q["price_usd"])
+    if conf in ("bad", "none"):
+        # The facilitator claims it captured and the chain does not support that — either
+        # contradicted ('bad') or nothing was given us to check ('none'). Funds MAY have
+        # moved, so RECORD before releasing: a released hold with no row is a settlement
+        # nobody can ever reconcile, and telling the buyer they weren't charged would be a
+        # claim we cannot support.
+        ledger.pending_add(settle_key, payer, q["price_usd"], s.get("tx") or "",
+                           f"settle reported success, on-chain check={conf}")
+        ledger.release(payer, q["price_usd"])
+        return _settle_failed(payer, budget_cap, ambiguous=True, tx=s.get("tx"))
     ledger.commit(payer, q["price_usd"])        # hold -> settled spend (raises _miss_limit)
+    ledger.pending_clear(settle_key)            # confirmed captured -> no longer ambiguous
     # NOTE: misses are LIFETIME-cumulative — a pass does NOT reset them. That makes the
     # proven free-miss allowance a consumable budget (not a resettable ceiling), so total
     # free judge-burn stays bounded by revenue. See _miss_limit / Rule 2.

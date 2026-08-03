@@ -99,18 +99,32 @@ def serve_search(query, *, x_payment=None, budget_cap=broker.DEFAULT_BUDGET_USD,
                 "query": query, "source": result.get("source"), "payer": payer,
                 "remaining_budget_usd": round(broker.remaining_budget(payer, budget_cap), 6)}
 
-    # only hand over results if the capture actually confirms on-chain
+    # Only hand over results if the capture actually confirms.
+    # WRITE-AHEAD — ported from broker.serve_burst 2026-07-28. Everything below can be
+    # interrupted by a process death, and a dead process writes nothing, so the record of
+    # "we are about to move money" must exist BEFORE we move it. Without this row a
+    # bestprice settlement is invisible to server.main()'s boot reconciliation forever.
+    settle_key = pay_key or f"{payer}|bestprice|{q['price_usd']}"
+    ledger.pending_add(settle_key, payer, q["price_usd"], "", "settle in flight")
     try:
         s = fac.settle(x_payment, reqs)
-    except Exception:
-        s = {"success": False}
-    if not s["success"]:
-        ledger.release(payer, q["price_usd"])   # capture didn't confirm -> free the hold
-        return {"status": "settle_failed", "charged": False, "price_usd": 0.0,
-                "query": query, "payer": payer,
-                "hint": ("payment capture did not confirm — results withheld and you were "
-                         "NOT charged; retry with a fresh payment")}
+    except Exception as e:
+        # The CALL died — we cannot know whether a broadcast went out and only the response
+        # was lost. AMBIGUOUS, not a clean failure: the row STAYS for reconciliation, and we
+        # do not tell the buyer they were not charged, because we do not know that. Telling
+        # them to "retry with a fresh payment" here is what could double-charge them.
+        ledger.pending_add(settle_key, payer, q["price_usd"], "",
+                           f"settle raised {type(e).__name__}")
+        ledger.release(payer, q["price_usd"])
+        return {**broker._settle_failed(payer, budget_cap, ambiguous=True), "query": query}
+    if not s.get("success"):
+        # An explicit failure report IS evidence: nothing was captured. Safe to clear.
+        # .get() not [] — a malformed facilitator dict must not raise past the hold.
+        ledger.pending_clear(settle_key)
+        ledger.release(payer, q["price_usd"])
+        return {**broker._settle_failed(payer, budget_cap), "query": query}
     ledger.commit(payer, q["price_usd"])
+    ledger.pending_clear(settle_key)            # confirmed captured -> no longer ambiguous
     return {"status": "ok", "charged": True, "price_usd": q["price_usd"],
             "tx": s.get("tx"), "mode": s.get("mode"),
             "query": query, "result": result, "count": len(deals), "payer": payer,
