@@ -1,12 +1,12 @@
 """test_concurrency.py — exercise the money path's concurrency guarantees for real.
 
-Every locking claim in this codebase is currently a COMMENT. `ledger.reserve` says two
-concurrent bursts from one wallet cannot both clear the cap. `claim_nonce` says K parallel
-requests sharing one authorization yield exactly one winner. `judge_enter` says the breaker
-counts in-flight work so it cannot be raced. `trial_claim` says a single-statement
-check-and-write beats read-then-act. None of it has ever met two simultaneous requests —
-there is no traffic, so the first real concurrency the settle window sees would be a real
-buyer with real USDC on Base mainnet.
+Locking guarantees are cheap to assert and expensive to verify. `ledger.reserve` holds that
+two concurrent bursts from one wallet cannot both clear the cap. `claim_nonce` holds that K
+parallel requests sharing one authorization yield exactly one winner. `judge_enter` holds
+that the breaker counts in-flight work so it cannot be raced. `trial_claim` holds that a
+single-statement check-and-write beats read-then-act. Each is a property the code is meant
+to have, and production is the wrong place to discover that it does not — a settle window
+racing for the first time against real USDC on Base mainnet is not a test.
 
 This proves the guards under genuine contention. Every thread waits on a barrier and is
 released together, so the race is real rather than incidental.
